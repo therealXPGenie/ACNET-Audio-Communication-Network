@@ -33,6 +33,7 @@ See ACKNOWLEDGEMENTS.md, NOTICE and THIRD_PARTY_LICENSES/ in the release.
 <!-- ACNET GGwave Mail One-Frame Retro Fix: compact legacy-readable X-ACNET-Mail envelope; exact 140B callsign/crypto/CRC budget; no ggwave truncation. -->
 <!-- ACNET Reliable CORS Pool Restore v5.43; 2FSK long-frame/ACK turnaround fix: airtime-balanced chunks + length-aware COLLECT watchdog.  ACNETGGwave payload/render fix: reference-sized GGwave web + ShowFile chunks, legacy CHK wire, callsign-safe requests, bare-Z4B recovery; Open.Mail Client Send Fix48. --><!-- ACNET R32 LONG-ARTICLE BROWSER: removes startup-frozen ~3061B response ceiling; 180k chunked web body cap, 9999 chunks, Z64 long-page compression with per-CHK CRC/ACK retry retained. -->
 <!-- ACNET HAM-3061 CAP: when HAM Mode is active, the complete relay browser response (HTTP/X-From headers + readable raw-text body) is hard-capped to 3061 UTF-8 bytes; normal browsing retains the long-article cap. -->
+<!-- ACNET OPEN.MAIL GROUP/RELAY WIRED R3: omr2 group resolver authoritative; Open.Mail service auto-routes without client relay entry; Open.Mail CHK payload = 160B at >=20 sym/s, 80B below 20 sym/s. -->
 <html lang="en"><head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"/>
@@ -16014,6 +16015,27 @@ async function onRxPacket(text, crcOk, bytes) {
     _senderCs = stripped.cs;
     text = stripped.text;
   }
+  // ── Open.Mail fragment ACK/NAK — max-reliability stop-and-confirm ───────
+  // OMFACK1/OMFNAK1 are intentionally tiny one-frame control replies.  They
+  // bypass the normal CHK response pipeline so account-create fragments can be
+  // acknowledged individually without turning each ACK into another chunked
+  // transfer.  A lost ACK simply causes the same fragment to be sent again.
+  try {
+    const _omFragCtl = String(text||'').trim().match(/^OMF(ACK|NAK)1\s+([A-Za-z0-9_-]{1,16})\s+(\d{1,5})(?:\s+(\d{1,5})[./](\d{1,5}))?$/i);
+    if (_omFragCtl && crcOk !== false) {
+      const _sid = _omFragCtl[2], _idx = Number(_omFragCtl[3]);
+      const _key = _sid+'::'+_idx;
+      const _map = window.__omFragAckWaiters || {};
+      const _w = _map[_key];
+      if (_w && typeof _w.resolve === 'function') {
+        try { if (_w.timer) clearTimeout(_w.timer); } catch(_) {}
+        delete _map[_key];
+        _w.resolve({ok:_omFragCtl[1].toUpperCase()==='ACK', nak:_omFragCtl[1].toUpperCase()==='NAK', sid:_sid, idx:_idx, received:Number(_omFragCtl[4]||0), total:Number(_omFragCtl[5]||0)});
+      }
+      try { addMsg('sys', (_omFragCtl[1].toUpperCase()==='ACK'?'✓':'↻')+' Open.Mail fragment '+(_idx+1)+' '+_omFragCtl[1].toUpperCase()); } catch(_) {}
+      return;
+    }
+  } catch(_omFragCtlErr) {}
   // R4 exact echo rejection. Do not reject packets merely because they arrive
   // shortly after TX; that broad policy was one cause of missed relay replies.
   // The normalized decoded body must exactly equal the payload just transmitted.
@@ -17828,10 +17850,10 @@ function _adaptiveChunkSize() {
   // FIX40/FIX41: outside HAM Mode, normal web/page fetches target 168B payload
   // chunks. In HAM Mode, all fetch/data payload chunks are capped to 100B.
   if (!_acnetChunkHamModeActive()) {
-    if (CFG && (_isTTYMode(CFG.mod))) {
-      return Math.max(ACNET_NORMAL_FETCH_CHUNK_MIN_BYTES, Math.min(ACNET_NORMAL_FETCH_CHUNK_MAX_BYTES, ACNET_NORMAL_FETCH_CHUNK_BYTES));
-    }
-    return Math.max(ACNET_NORMAL_FETCH_CHUNK_MIN_BYTES, Math.min(ACNET_NORMAL_FETCH_CHUNK_MAX_BYTES, ACNET_NORMAL_FETCH_CHUNK_BYTES));
+    // Normal FSK chunk target: 160B at 20 sym/s+, 80B below 20 sym/s.
+    // Open.Mail transmitChunked() enforces this as the actual CHK data size.
+    if (!(CFG && (_isTTYMode(CFG.mod)))) return sr >= 20 ? 160 : 80;
+    return sr >= 20 ? 160 : 80;
   }
   if (CFG && (_isTTYMode(CFG.mod))) {
     const pskHam = sr >= 62 ? 100 : sr >= 31 ? 96 : 88;
@@ -18241,6 +18263,13 @@ async function transmitChunked(respText, hostname, relayStatusFn) {
     const nonPayload = _acnetByteLen(_acnetCurrentCallsignPrefix()) + _acnetByteLen(header) + ACNET_FSK_FRAME_OVERHEAD_BYTES;
     const byteBudget = Number(capBytes || ACNET_AIR_TARGET_BYTES) - nonPayload;
     const airtimeBudget = _acnetAirtimePayloadBudget(nonPayload, ACNET_TX_BURST_TARGET_MS);
+    // Open.Mail payload policy: do not let the generic airtime budget collapse
+    // filename/credential responses to ~30B. At normal FSK rates use 160B of
+    // CHK data; below 20 sym/s use 80B. (The final chunk may be shorter.)
+    if (_isOmRelayTx && !_acnetChunkHamModeActive()) {
+      const omSr = Math.max(1, (CFG && CFG.symbolRate) || 10);
+      return omSr >= 20 ? 160 : 80;
+    }
     if (CFG && CFG.mod === 'dtmf') {
       return Math.max(16, Math.min(36, byteBudget));
     }
@@ -20188,7 +20217,7 @@ document.querySelectorAll('.vp-tab').forEach(t=>{
    public Filebin filename records requested through acnet://openmail/api.
 ═══════════════════════════════════════════════════════════════════════════*/
 const OM = {
-  user: '', pubB64: '', priv: null, sessionKey: null,
+  user: '', group:'', groupId:'', pubB64: '', priv: null, sessionKey: null,
   inbox: [], sent: [], view: 'login', busy: false, status: '', pending: null,
   lastListAt: 0, contacts: {},
   pendingById: {}, lastAuth: null, lastRelayFiles: [], lastRelayObj: null,
@@ -20196,13 +20225,32 @@ const OM = {
   loginHold: null, loginAttempt: null, pendingCredentialFiles: [],
   manualLogout: false, sessionSnapshot: null, sessionOpening: false
 };
-const OM_SHARED_BIN = 'openmail';
-const OM_REGISTRY_BIN = 'openmail';
+const OM_SHARED_BIN='openmail', OM_REGISTRY_BIN='openmail', OM_GROUP_LOGICAL_PREFIX='openmail-g-', OM_ROLLING_PREFIX='omr2', OM_NETWORK_SEED='openmail-fixed-rolling-2026', OM_LOOKBACK_DAYS=7, OM_DAY_MS=86400000;
 const OM_FBN_MAX_NAME = 120;
 const OM_CRED_FN_PREFIX = 'ua';
 const OM_CRED_FN_CHUNK_BUDGET = 72; // original safe value for max 16-char username
 const OM_CHUNK_RAW_BUDGET = 75;
 const OM_SERVER_RETENTION_DAYS = 6;
+let currentGroup='';
+function openMailFnv1a(text){ let h=0x811c9dc5; text=String(text||''); for(let i=0;i<text.length;i++) h=Math.imul(h^text.charCodeAt(i),0x01000193)>>>0; return h.toString(36); }
+function normalizeGroupName(value){ return String(value||'').trim().toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9_-]/g,'').replace(/^-+|-+$/g,'').slice(0,32); }
+function openMailGroupId(groupName){ const g=normalizeGroupName(groupName); return g ? openMailFnv1a('openmail-group:'+g)+openMailFnv1a(g+':openmail-group') : ''; }
+function currentGroupId(){ return openMailGroupId(currentGroup); }
+function openMailGroupLogicalBin(groupName){ const gid=openMailGroupId(groupName===undefined?currentGroup:groupName); return gid?OM_GROUP_LOGICAL_PREFIX+gid:OM_SHARED_BIN; }
+function openMailGroupIdForBin(binId){ const s=String(binId||''); if(s.startsWith(OM_GROUP_LOGICAL_PREFIX)) return s.slice(OM_GROUP_LOGICAL_PREFIX.length); if(!s||s===OM_SHARED_BIN) return currentGroupId(); return ''; }
+function openMailBinForDayOffset(offset,nowMs,explicitGroupId){ const day=Math.floor(Number(nowMs||Date.now())/OM_DAY_MS)+Number(offset||0), gid=String(explicitGroupId||currentGroupId()||''), seed=gid?OM_NETWORK_SEED+':group:'+gid:OM_NETWORK_SEED, tag=gid?gid.slice(0,7)+'-':''; return OM_ROLLING_PREFIX+'-'+tag+openMailFnv1a(seed+':'+day)+openMailFnv1a(day+':'+seed); }
+function openMailActiveBin(binId){ return openMailBinForDayOffset(0,undefined,openMailGroupIdForBin(binId)); }
+function openMailCandidateBins(includeLegacy,binId){ const out=[],gid=openMailGroupIdForBin(binId); for(let i=0;i<=OM_LOOKBACK_DAYS;i++) out.push(openMailBinForDayOffset(-i,undefined,gid)); if(!gid&&includeLegacy!==false) out.push(OM_SHARED_BIN); return Array.from(new Set(out)); }
+function openMailResolveWriteBin(binId){ const s=String(binId||''); return (!s||s===OM_SHARED_BIN||s.startsWith(OM_GROUP_LOGICAL_PREFIX))?openMailActiveBin(s):s; }
+function openMailResolveReadBins(binId){ const s=String(binId||''); return (!s||s===OM_SHARED_BIN||s.startsWith(OM_GROUP_LOGICAL_PREFIX))?openMailCandidateBins(true,s):[s]; }
+function omCurrentLogicalBin(){ return openMailGroupLogicalBin(currentGroup); }
+function omOpenMailAddress(user,groupName){ const u=omCleanUser(user),g=normalizeGroupName(groupName===undefined?currentGroup:groupName); return u&&g?u+'@'+g+'.open.mail':(u?u+'@open.mail':''); }
+function omParseOpenMailAddress(value){ const raw=String(value||'').trim(),m=raw.match(/^([a-z0-9_-]{1,32})@([a-z0-9_-]{1,32})\.open\.mail$/i); if(m) return {user:omCleanUser(m[1]),group:normalizeGroupName(m[2])}; if(/^[a-z0-9_-]{1,32}$/i.test(raw)) return {user:omCleanUser(raw),group:currentGroup}; return null; }
+function omGroupCacheKey(user){ return (currentGroupId()||'nogroup')+':'+omCleanUser(user); }
+function omSetActiveGroup(value){ const g=normalizeGroupName(value); if(!g) throw new Error('group required'); if(currentGroup&&currentGroup!==g){ OM.user='';OM.pubB64='';OM.priv=null;OM.sessionKey=null;OM.inbox=[];OM.sent=[];OM.contacts={};OM.credentialCache={};OM.lastRelayFiles=[];OM.lastRelayObj=null;OM.pendingCredentialFiles=[];OM.sessionSnapshot=null; try{window.__omOpenMailSession=null;}catch(_){} } currentGroup=g; OM.group=g; OM.groupId=openMailGroupId(g); try{localStorage.setItem('openmail_last_group',g);}catch(_){} return g; }
+function omInitGroup(){ if(currentGroup) return currentGroup; let g=''; try{g=normalizeGroupName(new URL(location.href).searchParams.get('group')||'');}catch(_){} try{if(!g)g=normalizeGroupName(localStorage.getItem('openmail_last_group')||'');}catch(_){} if(g){currentGroup=g;OM.group=g;OM.groupId=openMailGroupId(g);} return g; }
+function omApplyLoginRouting(){ const ge=document.getElementById('omGroup'); if(ge) omSetActiveGroup(ge.value); else if(!currentGroup) throw new Error('group required'); return omCurrentLogicalBin(); }
+omInitGroup();
 
 function omLog(msg, type){ try { addMsg('sys', '✉ Open.Mail: ' + msg); } catch(_) {} try { console[type==='err'?'error':'log']('[ACNET Open.Mail]', msg); } catch(_){} }
 function omSetStatus(s){ OM.status = s || ''; try { bStat.textContent = s ? ('✉ ' + s) : '✉ Open.Mail'; } catch(_){} }
@@ -20244,12 +20292,13 @@ const OMCrypto = {
   async aesGcmDecrypt(key,iv,bytes){ const c=omRequireWebCrypto('AES-GCM decrypt'); return new Uint8Array(await c.subtle.decrypt({name:'AES-GCM',iv},key,bytes)); }
 };
 
-function omCleanCredentialForStorage(cred){ const c={}; ['version','username','salt','passwordHash','pubKeyB64','encryptedPriv','createdAt','storage'].forEach(k=>{ if(cred && cred[k]!==undefined) c[k]=cred[k]; }); c.version=Math.max(2, Number(c.version||2)); c.storage='filename-chunks'; return c; }
+function omCleanCredentialForStorage(cred){ const c={}; ['version','username','groupId','salt','passwordHash','pubKeyB64','encryptedPriv','createdAt','accountDay','storage'].forEach(k=>{ if(cred && cred[k]!==undefined) c[k]=cred[k]; }); c.version=Math.max(2, Number(c.version||2)); c.storage='filename-chunks'; return c; }
 function omMakeCredentialFilenames(credObj){ const clean=omCleanCredentialForStorage(credObj); const payload=omStrToB64Url(JSON.stringify(clean)); const cid=Date.now().toString(36)+Math.random().toString(36).slice(2,8); const total=Math.ceil(payload.length/OM_CRED_FN_CHUNK_BUDGET)||1; if(total>1295) throw new Error('credential record too large'); const names=[]; for(let i=0;i<total;i++){ const part=payload.slice(i*OM_CRED_FN_CHUNK_BUDGET,(i+1)*OM_CRED_FN_CHUNK_BUDGET); const fn=`${OM_CRED_FN_PREFIX}-${cid}-${i.toString(36)}-${total.toString(36)}-${part}`; if(fn.length>OM_FBN_MAX_NAME) throw new Error('credential filename exceeds Filebin limit'); names.push(fn); } return names; }
 function omParseCredentialFilename(fn){ fn=String(fn||''); const m=fn.match(/^ua-([a-z0-9]+)-([0-9a-z]+)-([0-9a-z]+)-([A-Za-z0-9_-]+)$/); if(!m) return null; return {cid:m[1],idx:parseInt(m[2],36),total:parseInt(m[3],36),data:m[4],filename:fn}; }
-function omReconstructCredentialsFromFiles(files,wantedUser){
+function omReconstructCredentialsFromFiles(files,wantedUser,expectedGroupId){
   const groups=new Map();
   const want=omCleanUser(wantedUser||'');
+  const expectedGroup=String(expectedGroupId===undefined?currentGroupId():(expectedGroupId||''));
   for(const f of files||[]){
     const candidates=[];
     try{
@@ -20291,6 +20340,7 @@ function omReconstructCredentialsFromFiles(files,wantedUser){
     try{
       const cred=JSON.parse(omB64UrlToStr(payload));
       if(want && omCleanUser(cred.username)!==want) return;
+      if(cred.groupId && expectedGroup && cred.groupId!==expectedGroup) return;
       cred._source='filename'; cred._cid=cid; cred._filenames=g.filenames;
       out.push(cred);
     }catch(e){ omLog('credential filename decode skipped: '+(e.message||e),'err'); }
@@ -20536,7 +20586,7 @@ function omBuildJsonHttp(status,obj){ return 'HTTP/1.1 '+status+' OK\r\nX-From: 
 // commands without the extra HTTP header overhead, while the relay still sends
 // back a normal HTTP+JSON response so existing client rendering/intercept works.
 const OM_RPC_MAGIC = 'OMRPC1';
-function omTargetForRelay(){ const t = activeClientRelayTarget(); return t || 'openmail'; }
+function omTargetForRelay(){ return 'openmail'; }
 function omRpcWireEnc(v){ return encodeURIComponent(String(v==null?'':v)); }
 function omRpcWireDec(v){ try { return decodeURIComponent(String(v==null?'':v)); } catch(_) { return String(v==null?'':v); } }
 function omBuildRpcWire(payload){
@@ -20614,8 +20664,11 @@ function omRpcTargetOf(text){
 function omRpcAllowedForThisRelay(text){
   const my = activeRelayCallsign();
   if(!my) return true; // unnamed/open relay
-  const target = callsignNormalize(omRpcTargetOf(text));
-  // Named relays never accept the legacy `openmail` broadcast target.
+  const rawTarget = String(omRpcTargetOf(text)||'').trim();
+  // `openmail` is the service/broadcast target: the client never needs to know
+  // the relay callsign. Explicit relay targets remain strict when supplied.
+  if(!rawTarget || /^openmail$/i.test(rawTarget)) return true;
+  const target = callsignNormalize(rawTarget);
   return !!target && target.toLowerCase() === my.toLowerCase();
 }
 function omParseRpcPayloadText(body,label){
@@ -20719,14 +20772,15 @@ async function omRelayRouteRequest(req,url){
       }
       throw apiErr;
     }
-    // Fragments are one-way: client does not wait for a response per fragment.
-    // Suppress the relay ACK TX entirely — no CHK pipeline needed per fragment.
-    // The ucommit round-trip is the only relay response in an upload sequence.
+    // Reliability fallback: the fast fragment path normally emits a compact
+    // OMFACK1/OMFNAK1 control frame.  If that fast path is unavailable, return
+    // the normal JSON result so the generic Open.Mail response path still ACKs
+    // rather than silently treating the fragment as fire-and-forget.
     if(isUfrag){
       const idx = payload.idx!==undefined?payload.idx:(payload.i!==undefined?payload.i:0);
       const tot = payload.total!==undefined?payload.total:(payload.t!==undefined?payload.t:'?');
-      try{ addMsg('sys','✓ Open.Mail upload fragment '+idx+'/'+tot+' stored; no ACK TX'); }catch(_){}
-      return '__OM_NO_REPLY__';
+      try{ addMsg('sys','✓ Open.Mail upload fragment '+idx+'/'+tot+' stored; ACK required'); }catch(_){}
+      return omBuildJsonHttp(200,Object.assign({id},result||{}));
     }
     return omBuildJsonHttp(200,Object.assign({id},result));
   }catch(e){
@@ -20793,7 +20847,7 @@ function omSnapshotSession(reason){
     if(!OM.user || !OM.priv || !OM.sessionKey) return false;
     OM.manualLogout=false;
     OM.sessionSnapshot={
-      user:OM.user, pubB64:OM.pubB64, priv:OM.priv, sessionKey:OM.sessionKey,
+      user:OM.user, group:currentGroup, groupId:currentGroupId(), pubB64:OM.pubB64, priv:OM.priv, sessionKey:OM.sessionKey,
       inbox:Array.isArray(OM.inbox)?OM.inbox:[], sent:Array.isArray(OM.sent)?OM.sent:[],
       contacts:OM.contacts||{}, view:OM.view||'inbox', at:Date.now(), reason:reason||''
     };
@@ -20807,7 +20861,9 @@ function omRestoreSession(reason){
     if(OM.manualLogout) return false;
     const snap=OM.sessionSnapshot || window.__omOpenMailSession;
     if(!snap || !snap.user || !snap.priv || !snap.sessionKey) return false;
-    OM.user=omCleanUser(snap.user);
+    if(snap.groupId && currentGroupId() && snap.groupId!==currentGroupId()) return false;
+    if(!currentGroup && snap.group) omSetActiveGroup(snap.group);
+    OM.user=omCleanUser(snap.user); OM.group=currentGroup; OM.groupId=currentGroupId();
     OM.pubB64=snap.pubB64||OM.pubB64||'';
     OM.priv=snap.priv; OM.sessionKey=snap.sessionKey;
     OM.inbox=Array.isArray(snap.inbox)?snap.inbox:(Array.isArray(OM.inbox)?OM.inbox:[]);
@@ -20816,7 +20872,7 @@ function omRestoreSession(reason){
     OM.view=snap.view||'inbox';
     OM.pendingCredentialUser='';
     OM.sessionSnapshot=snap;
-    omSetStatus('session restored locally as '+OM.user+'@open.mail');
+    omSetStatus('session restored locally as '+omOpenMailAddress(OM.user));
     omLog('restored Open.Mail session before '+(reason||'render'));
     return true;
   }catch(e){ try{ omLog('session restore failed: '+(e.message||e),'err'); }catch(_){} return false; }
@@ -20831,7 +20887,8 @@ function omLoginHoldActive(){
 }
 function omCacheCredential(cred){
   if(!cred || !cred.username) return;
-  try { OM.credentialCache[omCleanUser(cred.username)] = cred; } catch(_) {}
+  if(cred.groupId && currentGroupId() && cred.groupId!==currentGroupId()) return;
+  try { OM.credentialCache[omGroupCacheKey(cred.username)] = cred; } catch(_) {}
 }
 function omNormalizeRelayFiles(files){
   return (files||[]).map(f=>{
@@ -20925,7 +20982,7 @@ function omKeepOpenMailHoldAfterError(err){
 function omCredentialFromAnyCache(user){
   const u=omCleanUser(user||'');
   let cred=null;
-  try{ if(u && OM.credentialCache && OM.credentialCache[u]) cred=OM.credentialCache[u]; }catch(_){}
+  try{ if(u && OM.credentialCache && OM.credentialCache[omGroupCacheKey(u)]) cred=OM.credentialCache[omGroupCacheKey(u)]; }catch(_){}
   if(!cred){ try{ cred=omReconstructCredentialsFromFiles(OM.pendingCredentialFiles||[],u); }catch(_){} }
   if(!cred){ try{ cred=omReconstructCredentialsFromFiles(OM.lastRelayFiles||[],u); }catch(_){} }
   if(cred) omCacheCredential(cred);
@@ -20970,7 +21027,7 @@ async function omFinalizeLoginFromBufferedFiles(reason, renderAfter=true){
     const ok=await omOpenFromCredentialFiles(pool,u,false);
     if(ok){
       omSnapshotSession('finalized-after-rx-complete');
-      omSetStatus('logged in as '+OM.user+'@open.mail');
+      omSetStatus('logged in as '+omOpenMailAddress(OM.user));
       if(renderAfter!==false) renderOpenMailApp('openmail');
       return true;
     }
@@ -20999,18 +21056,19 @@ function omDeferLoginRender(reason){
 async function omOpenSessionFromCredential(user,password,cred,refreshAfter){
   user=omCleanUser(user);
   if(!user||!password) throw new Error('username and password required');
-  if(!cred) throw new Error('account not found — create it first');
+  if(!cred) throw new Error('account not found in group '+(currentGroup||'?')+' — check group/account');
+  if(cred.groupId && currentGroupId() && cred.groupId!==currentGroupId()) throw new Error('account belongs to a different Open.Mail group');
   const hash=await OMCrypto.sha256(password+cred.salt);
   if(hash!==cred.passwordHash) throw new Error('invalid password');
   const aesKey=await OMCrypto.deriveAesFromPassword(password,cred.salt);
   const privJwk=await OMCrypto.decryptJson(cred.encryptedPriv,aesKey);
   OM.priv=await OMCrypto.importPrivateJwk(privJwk);
-  OM.sessionKey=aesKey; OM.pubB64=cred.pubKeyB64; OM.user=user; OM.view='inbox'; OM.pendingCredentialUser='';
+  OM.sessionKey=aesKey; OM.pubB64=cred.pubKeyB64; OM.user=user; OM.group=currentGroup; OM.groupId=currentGroupId(); OM.view='inbox'; OM.pendingCredentialUser='';
   OM.loginHold=null; OM.loginAttempt=null; OM.sessionOpening=false; OM.manualLogout=false;
   try{ window.__omOpenMailLoginAttempt=null; }catch(_){}
   try{ const c=JSON.parse(localStorage.getItem('acnet_openmail_contacts')||'{}'); if(c&&typeof c==='object') OM.contacts=c; }catch(_){}
   omSnapshotSession('credential-opened');
-  omLog('client reconstructed account data for '+user+'@open.mail');
+  omLog('client reconstructed account data for '+omOpenMailAddress(user));
   if(refreshAfter){
     const haveSameList = !!(clientMode && Array.isArray(OM.lastRelayFiles) && OM.lastRelayFiles.length);
     if(haveSameList){
@@ -21027,7 +21085,7 @@ async function omOpenSessionFromCredential(user,password,cred,refreshAfter){
     }
   }
   omSnapshotSession('post-refresh');
-  omSetStatus('logged in as '+user+'@open.mail');
+  omSetStatus('logged in as '+omOpenMailAddress(user));
   renderOpenMailApp('openmail');
   return true;
 }
@@ -21422,6 +21480,7 @@ function omArmPendingTimeout(payloadId, timeoutMs, reject){
 }
 async function _omRpcUnlocked(payload){
   payload=Object.assign({},payload);
+  if(currentGroup && (!payload.bin || payload.bin===OM_SHARED_BIN || payload.bin===OM_REGISTRY_BIN)) payload.bin=omCurrentLogicalBin();
   payload.id=payload.id||('om'+Date.now().toString(36)+Math.random().toString(36).slice(2,7));
   if(!clientMode){ omSetStatus('Open.Mail direct/relay internet op '+payload.op); return await omRelayApi(payload); }
   await omEnsureAudioForClient();
@@ -21498,7 +21557,7 @@ async function omFetchCredential(uname){
   const u=omCleanUser(uname);
   let cred=omCredentialFromAnyCache(u);
   if(cred){ omCacheCredential(cred); return cred; }
-  const files=await omList(OM_SHARED_BIN,omUserPrefix(u),{scope:'cred',limit:1});
+  const files=await omList(omCurrentLogicalBin(),omUserPrefix(u),{scope:'cred',limit:1});
   cred=omReconstructCredentialsFromFiles(files,u) || omCredentialFromAnyCache(u) || null;
   if(cred) omCacheCredential(cred);
   return cred;
@@ -21568,7 +21627,7 @@ async function omSignup(user,password,confirm){
   OM.contacts[user] = pubB64;
   try { localStorage.setItem('acnet_openmail_contacts', JSON.stringify(OM.contacts)); } catch(_) {}
   await omOpenSessionFromCredential(user,password,cred,false);
-  omSetStatus('account created as '+user+'@open.mail');
+  omSetStatus('account created as '+omOpenMailAddress(user));
 }
 async function omLogin(user,password){
   user=omCleanUser(user);
@@ -21591,7 +21650,7 @@ async function omLogin(user,password){
       // fresh list and then triggers a second list RPC after the first RX
       // completion.  The second RPC was aborting/rearming the same client
       // stream and leaving the login stuck after all chunks were received.
-      let files=await omList(OM_SHARED_BIN, omUserPrefix(user), {scope:'login',limit:8});
+      let files=await omList(omCurrentLogicalBin(), omUserPrefix(user), {scope:'login',limit:8});
       if(OM.user && OM.priv){
         try { await omProcessInboxFiles(files,false); } catch(e){ omLog('post-login same-list inbox process skipped: '+(e.message||e),'err'); }
         omSnapshotSession('login-success-relay-list-consumed');
@@ -21605,7 +21664,7 @@ async function omLogin(user,password){
         // mid-scan or filebin may have returned an empty result transiently.
         omSetStatus('credential not found — retrying list');
         await new Promise(r => setSafeTimeout(r, 1800));
-        files = await omList(OM_SHARED_BIN, omUserPrefix(user), {scope:'login-retry',limit:8});
+        files = await omList(omCurrentLogicalBin(), omUserPrefix(user), {scope:'login-retry',limit:8});
         pool = omNormalizeRelayFiles([...(OM.pendingCredentialFiles||[]),...(OM.lastRelayFiles||[]),...((OM.lastRelayObj&&OM.lastRelayObj.files)||[]),...(files||[])]);
         cred = omReconstructCredentialsFromFiles(pool,user) || omCredentialFromAnyCache(user);
       }
@@ -21664,7 +21723,7 @@ async function omRefreshInbox(renderAfter=true){
   let _refreshErr = null;
   for(let _refreshRound = 0; _refreshRound < 2; _refreshRound++){
     try{
-      const files=await omList(OM_SHARED_BIN,omUserPrefix(OM.user),{scope:'mail',limit:24});
+      const files=await omList(omCurrentLogicalBin(),omUserPrefix(OM.user),{scope:'mail',limit:24});
       await omProcessInboxFiles(files,renderAfter);
       _refreshErr = null;
       break;
@@ -21685,7 +21744,7 @@ async function omRefreshInbox(renderAfter=true){
   if(_refreshErr) throw _refreshErr;
   omSnapshotSession('post-inbox-refresh');
 }
-async function omSendEmail(to,subject,body){ if(!OM.priv||!OM.user) throw new Error('not logged in'); const toUser=omCleanUser(String(to||'').replace(/@open\.mail$/i,'')); if(!toUser) throw new Error('recipient required'); omSetStatus('looking up '+toUser+' public key'); const pubB64=await omLookupPublicKeyB64(toUser); if(!pubB64) throw new Error('recipient key not found; have recipient create Open.Mail account or scan registry'); const recPub=await OMCrypto.importPublicRaw(omB64UrlToBytes(pubB64)); const from=OM.user+'@open.mail'; const pack=await omEncryptEmailFilenames(recPub,from,subject||'(no subject)',body||'',Date.now()); const pfx=omUserPrefix(toUser); const names=[pack.header].concat(pack.chunks); for(let i=0;i<names.length;i++){ omSetStatus('uploading encrypted mail '+(i+1)+'/'+names.length); await omUpload(pfx+names[i],'{}'); await new Promise(r=>setSafeTimeout(r,80)); } OM.sent.unshift({to:toUser+'@open.mail',subject:subject||'(no subject)',body:body||'',date:Date.now(),snippet:String(body||'').replace(/\s+/g,' ').slice(0,90)}); omSetStatus('sent to '+toUser+'@open.mail'); renderOpenMailApp('openmail/sent'); }
+async function omSendEmail(to,subject,body){ if(!OM.priv||!OM.user) throw new Error('not logged in'); const toUser=omCleanUser(String(to||'').replace(/@open\.mail$/i,'')); if(!toUser) throw new Error('recipient required'); omSetStatus('looking up '+toUser+' public key'); const pubB64=await omLookupPublicKeyB64(toUser); if(!pubB64) throw new Error('recipient key not found; have recipient create Open.Mail account or scan registry'); const recPub=await OMCrypto.importPublicRaw(omB64UrlToBytes(pubB64)); const from=OM.user+'@open.mail'; const pack=await omEncryptEmailFilenames(recPub,from,subject||'(no subject)',body||'',Date.now()); const pfx=omUserPrefix(toUser); const names=[pack.header].concat(pack.chunks); for(let i=0;i<names.length;i++){ omSetStatus('uploading encrypted mail '+(i+1)+'/'+names.length); await omUpload(pfx+names[i],'{}'); await new Promise(r=>setSafeTimeout(r,80)); } OM.sent.unshift({to:omOpenMailAddress(toUser),subject:subject||'(no subject)',body:body||'',date:Date.now(),snippet:String(body||'').replace(/\s+/g,' ').slice(0,90)}); omSetStatus('sent to '+omOpenMailAddress(toUser)); renderOpenMailApp('openmail/sent'); }
 async function omRemoveInbox(idx){ const em=OM.inbox[idx]; if(!em) return; if(em.chunks) for(const c of em.chunks) omDelete(c).catch(()=>{}); if(em.filename) omDelete(em.filename).catch(()=>{}); OM.inbox.splice(idx,1); renderOpenMailApp('openmail'); }
 
 function renderOpenMailApp(route){
@@ -21719,7 +21778,8 @@ function renderOpenMailApp(route){
   app.style.height = '100%';
 
   const modeTxt = clientMode ? 'CLIENT: data-over-sound via relay' : 'DIRECT/RELAY: local internet path';
-  const addr = OM.user ? OM.user + '@open.mail' : 'not logged in';
+  omInitGroup();
+  const addr = OM.user ? omOpenMailAddress(OM.user) : 'not logged in';
   const unread = OM.inbox.filter(m => !m.read).length;
 
   app.innerHTML = `<div class="mail-hdr">
@@ -21745,14 +21805,14 @@ function renderOpenMailApp(route){
 
   if(!OM.user && (route.includes('/hold') || omLoginHoldActive() || OM.sessionOpening || OM._finalizingLogin)){
     const preUser = omCleanUser((OM.pendingCredentialUser || (OM.loginHold && OM.loginHold.user) || (OM.lastAuth && OM.lastAuth.user) || ''));
-    body.innerHTML = `<div class="mail-empty"><div class="mail-empty-icon">🔐</div><div class="mail-empty-msg">Open.Mail session is being restored for ${omEsc(preUser||'this user')}@open.mail</div><div class="mail-empty-hint">Filename chunks are being reconstructed/decrypted locally. The client will stay in Open.Mail and will not return to login unless authentication really fails.</div><div style="margin-top:12px"><button class="mail-btn blue" data-om="inbox">OPEN INBOX</button></div><div style="font-size:.6rem;color:var(--dim);margin-top:10px">${omEsc(OM.status||modeTxt)}</div></div>`;
+    body.innerHTML = `<div class="mail-empty"><div class="mail-empty-icon">🔐</div><div class="mail-empty-msg">Open.Mail session is being restored for ${omEsc(preUser&&currentGroup?omOpenMailAddress(preUser):preUser||'this user')}</div><div class="mail-empty-hint">Filename chunks are being reconstructed/decrypted locally. The client will stay in Open.Mail and will not return to login unless authentication really fails.</div><div style="margin-top:12px"><button class="mail-btn blue" data-om="inbox">OPEN INBOX</button></div><div style="font-size:.6rem;color:var(--dim);margin-top:10px">${omEsc(OM.status||modeTxt)}</div></div>`;
   }
   else if(!OM.user){
     const preUser = omCleanUser((OM.pendingCredentialUser || (OM.lastAuth && OM.lastAuth.user) || ''));
-    body.innerHTML = `<div class="mail-compose" style="max-width:520px;margin:24px auto;height:auto;border:1px solid var(--border);flex:none"><div class="mail-read-hdr"><div class="mrh-val subject">Open.Mail login / create</div><div style="font-size:.6rem;color:var(--dim);line-height:1.8;margin-top:8px">In CLIENT mode this sends only public/filename records through audio. Password verification and private-key decryption stay on this browser.</div></div><div class="mc-field"><span class="mc-lbl">USER</span><input class="mc-in" id="omUser" placeholder="username" value="${omEsc(preUser)}"></div><div class="mc-field"><span class="mc-lbl">PASS</span><input class="mc-in" id="omPass" type="password" placeholder="password"></div><div class="mc-field"><span class="mc-lbl">CONFIRM</span><input class="mc-in" id="omConfirm" type="password" placeholder="only for create account"></div><div class="mc-footer"><button type="button" class="mail-btn" data-om="login">LOG IN</button><button type="button" class="mail-btn blue" data-om="signup" onclick="return ACNET_OPENMAIL_CREATE_ACCOUNT(event)">CREATE ACCOUNT</button><span style="flex:1"></span><span>${omEsc(OM.status||modeTxt)}</span></div></div>`;
+    body.innerHTML = `<div class="mail-compose" style="max-width:520px;margin:24px auto;height:auto;border:1px solid var(--border);flex:none"><div class="mail-read-hdr"><div class="mrh-val subject">Open.Mail login / create</div><div style="font-size:.6rem;color:var(--dim);line-height:1.8;margin-top:8px">Group selects the deterministic Open.Mail network. CLIENT mode discovers an Open.Mail relay automatically; passwords/private keys stay local.</div></div><div class="mc-field"><span class="mc-lbl">GROUP</span><input class="mc-in" id="omGroup" placeholder="group" value="${omEsc(currentGroup||'')}"></div><div class="mc-field"><span class="mc-lbl">USER</span><input class="mc-in" id="omUser" placeholder="username" value="${omEsc(preUser)}"></div><div class="mc-field"><span class="mc-lbl">PASS</span><input class="mc-in" id="omPass" type="password" placeholder="password"></div><div class="mc-field"><span class="mc-lbl">CONFIRM</span><input class="mc-in" id="omConfirm" type="password" placeholder="only for create account"></div><div class="mc-footer"><button type="button" class="mail-btn" data-om="login">LOG IN</button><button type="button" class="mail-btn blue" data-om="signup" onclick="return ACNET_OPENMAIL_CREATE_ACCOUNT(event)">CREATE ACCOUNT</button><span style="flex:1"></span><span>${omEsc(OM.status||modeTxt)}</span></div></div>`;
   }
   else if(route.includes('/compose')){
-    body.innerHTML = `<div class="mail-compose"><div class="mc-field"><span class="mc-lbl">FROM</span><span class="mrh-val from">${omEsc(addr)}</span></div><div class="mc-field"><span class="mc-lbl">TO</span><input class="mc-in" id="omTo" placeholder="recipient or recipient@open.mail"></div><div class="mc-field"><span class="mc-lbl">SUBJECT</span><input class="mc-in" id="omSubject" placeholder="subject"></div><div class="mc-body-wrap"><textarea class="mc-body" id="omBody" placeholder="Encrypted with recipient public key. For binary files, upload in 🗂 files and paste the acnet://showfile link here."></textarea></div><div class="mc-footer"><button class="mail-btn blue" data-om="inbox">← INBOX</button><button class="mail-btn" data-om="send">SEND ENCRYPTED</button><span class="mc-note">${omEsc(OM.status||'ready')}</span></div></div>`;
+    body.innerHTML = `<div class="mail-compose"><div class="mc-field"><span class="mc-lbl">FROM</span><span class="mrh-val from">${omEsc(addr)}</span></div><div class="mc-field"><span class="mc-lbl">TO</span><input class="mc-in" id="omTo" placeholder="recipient or recipient@group.open.mail"></div><div class="mc-field"><span class="mc-lbl">SUBJECT</span><input class="mc-in" id="omSubject" placeholder="subject"></div><div class="mc-body-wrap"><textarea class="mc-body" id="omBody" placeholder="Encrypted with recipient public key. For binary files, upload in 🗂 files and paste the acnet://showfile link here."></textarea></div><div class="mc-footer"><button class="mail-btn blue" data-om="inbox">← INBOX</button><button class="mail-btn" data-om="send">SEND ENCRYPTED</button><span class="mc-note">${omEsc(OM.status||'ready')}</span></div></div>`;
   }
   else if(route.includes('/sent')){
     body.innerHTML = omRenderOpenMailList('sent');
@@ -21786,8 +21846,9 @@ async function omCreateAccountFromUi(ev){
   const pw = pEl ? pEl.value : '';
   const cf = cEl ? cEl.value : '';
   try{
+    omApplyLoginRouting();
     omRememberAuth(u,pw);
-    omSetStatus('creating Open.Mail account — generating keys locally');
+    omSetStatus('creating Open.Mail account in '+currentGroup+' — generating keys locally');
     addMsg('sys', '🔐 Open.Mail CREATE ACCOUNT selected — create path only, no login/list pre-check');
     const btn = ev && ev.currentTarget ? ev.currentTarget : null;
     if(btn) btn.disabled = true;
@@ -21821,6 +21882,7 @@ async function omOnClick(ev){
       const pEl = document.getElementById('omPass');
       const u = uEl ? uEl.value : '';
       const pw = pEl ? pEl.value : '';
+      omApplyLoginRouting();
       omRememberAuth(u,pw);
       // FIX47: omRpc owns the adaptive timeout and extends it while chunks are
       // moving. A fixed 120s Promise.race used to launch a second LIST while the
@@ -25202,7 +25264,7 @@ try {
   }
   function nowId(prefix){ return (prefix || 'om') + Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
   function byteLen(s){ try { return _ENC.encode(S(s)).length; } catch(_) { return S(s).length; } }
-  function safeBin(b){ return S(b || OM_SHARED_BIN || 'openmail').replace(/[^A-Za-z0-9._-]/g,'') || 'openmail'; }
+  function safeBin(b){ let x=S(b||''); if(currentGroup&&(!x||x===OM_SHARED_BIN||x===OM_REGISTRY_BIN)) x=omCurrentLogicalBin(); return S(x||OM_SHARED_BIN).replace(/[^A-Za-z0-9._-]/g,'')||OM_SHARED_BIN; }
   function decodeMaybe(v){ try { return decodeURIComponent(S(v)); } catch(_) { return S(v); } }
   function maxName(){ return Number(OM_FBN_MAX_NAME || 120) || 120; }
   function sanitizeFileName(name){
@@ -25413,7 +25475,8 @@ try {
       const iv=Array.from(omB64UrlToBytes(String(a[4]||''))), data=Array.from(omB64UrlToBytes(String(a[5]||'')));
       const createdAt=parseInt(String(a[6]||'0'),36);
       if(!compactAccountUser||iv.length!==12||!data.length||!Number.isFinite(createdAt)) throw new Error('compact account payload is invalid');
-      const cred=omCleanCredentialForStorage({version:3,username:compactAccountUser,salt:b64ToHex(a[1]),passwordHash:b64ToHex(a[2]),pubKeyB64:String(a[3]||''),encryptedPriv:JSON.stringify({iv,d:data}),createdAt,accountDay:(typeof accountDayKey==='function'?accountDayKey(createdAt):Math.floor(createdAt/86400000)),storage:'filename-chunks'});
+      const _acctGid=String(spec.bin||'').startsWith(OM_GROUP_LOGICAL_PREFIX)?String(spec.bin).slice(OM_GROUP_LOGICAL_PREFIX.length):'';
+      const cred=omCleanCredentialForStorage({version:4,username:compactAccountUser,groupId:_acctGid||undefined,salt:b64ToHex(a[1]),passwordHash:b64ToHex(a[2]),pubKeyB64:String(a[3]||''),encryptedPriv:JSON.stringify({iv,d:data}),createdAt,accountDay:(typeof accountDayKey==='function'?accountDayKey(createdAt):Math.floor(createdAt/86400000)),storage:'filename-chunks'});
       const prefix=omUserPrefix(compactAccountUser);
       spec={bin:spec.bin,records:[{filename:prefix+'cred-'+compactAccountUser,content:JSON.stringify(cred)},...omMakeCredentialFilenames(cred).map(fn=>({filename:prefix+fn,content:'{}'})),{filename:omMakeRegistryFilename(compactAccountUser,cred.pubKeyB64),content:'{}'}]};
     }
@@ -25473,6 +25536,7 @@ try {
       const parts = ['o=pub'];
       if(payload.id) parts.push('i='+enc(payload.id));
       const u = publicIdOfPayload(payload);
+      if(payload.bin && payload.bin!==OM_SHARED_BIN) parts.push('b='+enc(payload.bin));
       if(u) parts.push('u='+enc(u));
       return OM_RPC_MAGIC+' '+target+' '+parts.join('&');
     }
@@ -25592,6 +25656,43 @@ try {
     return {eid, header, chunks, rawBudget};
   }
 
+  // Compact per-fragment ACK waiters.  The receiver-side onRxPacket intercept
+  // resolves these before generic echo/client/relay routing.
+  window.__omFragAckWaiters = window.__omFragAckWaiters || Object.create(null);
+  function omArmFragAck(sid, idx, timeoutMs){
+    const key=String(sid)+'::'+Number(idx);
+    const map=window.__omFragAckWaiters;
+    const old=map[key];
+    if(old){ try{ if(old.timer) clearTimeout(old.timer); }catch(_){}; delete map[key]; }
+    let done=false, resolveOuter;
+    const promise=new Promise(resolve=>{ resolveOuter=resolve; });
+    const timer=setSafeTimeout(()=>{
+      if(done) return; done=true; delete map[key];
+      resolveOuter({ok:false,timeout:true,sid:String(sid),idx:Number(idx)});
+    },Math.max(3000,Number(timeoutMs)||12000));
+    map[key]={timer,resolve:(v)=>{ if(done) return; done=true; try{clearTimeout(timer);}catch(_){}; delete map[key]; resolveOuter(v||{ok:false}); }};
+    return {promise,cancel:()=>{ if(done) return; done=true; try{clearTimeout(timer);}catch(_){}; delete map[key]; resolveOuter({ok:false,cancelled:true,sid:String(sid),idx:Number(idx)}); }};
+  }
+  function omFragAckTimeoutMs(){
+    try{
+      if(CFG&&CFG.mod==='ggwave') return 9000;
+      const sr=Math.max(1,Number(CFG&&CFG.symbolRate)||10);
+      return sr>=50?9000:sr>=36?12000:sr>=30?15000:sr>=20?22000:36000;
+    }catch(_){ return 22000; }
+  }
+  function omRearmAfterFragTx(){
+    try{
+      if(decoder&&typeof decoder.txMuteUntil==='number'){
+        const sr=Math.max(1,Number(CFG&&CFG.symbolRate)||10);
+        const gate=(CFG&&CFG.mod==='ggwave')?180:(sr>=30?260:sr>=20?320:420);
+        const cap=Date.now()+gate;
+        if(decoder.txMuteUntil>cap) decoder.txMuteUntil=cap;
+        if(decoder._postDecodeGateUntil>cap) decoder._postDecodeGateUntil=cap;
+      }
+    }catch(_){}
+    try{ ensureClientStream('acnet://openmail/frag-ack'); }catch(_){}
+  }
+
   async function commitRecordsOverAudio(records, options){
     options = options || {};
     records = Array.isArray(records) ? records : [];
@@ -25684,13 +25785,30 @@ try {
     function fragDataWithCrc(data){ const d = String(data); return d + '|' + crc16String(d); }
 
     async function sendFrag(i, round){
-      // Omit 'id' field from ufrag wire — fire-and-forget frames have no pending
-      // slot to match, and the id field adds ~18 chars of overhead per frame.
-      setStatus('CLIENT → relay upload frag '+(i+1)+'/'+total+(round ? ' repair'+round : ''));
+      // Stop-and-confirm reliability: never advance to fragment i+1 until the
+      // relay has explicitly ACKed i.  If the fragment or its ACK is lost, the
+      // same sequence number is retransmitted; duplicate storage is idempotent.
       const wire = omBuildRpcWire({op:'ufrag', sid, idx:i, total, data:fragDataWithCrc(parts[i]), callSight:cs});
-      try { await transmit(wire, false); }
-      catch(e) { log('sendFrag '+i+' tx err: '+((e&&e.message)||e), true); }
-      await sleep(interFragMs);
+      const MAX_FRAG_ATTEMPTS=18;
+      for(let attempt=1; attempt<=MAX_FRAG_ATTEMPTS; attempt++){
+        setStatus('CLIENT → relay upload frag '+(i+1)+'/'+total+(round ? ' repair'+round : '')+' try '+attempt);
+        const waiter=omArmFragAck(sid,i,omFragAckTimeoutMs());
+        let txOk=true;
+        try { await transmit(wire, false); }
+        catch(e) { txOk=false; log('fragment '+(i+1)+' TX error try '+attempt+': '+((e&&e.message)||e), true); }
+        omRearmAfterFragTx();
+        if(!txOk){ waiter.cancel(); await sleep(Math.min(2500,500+attempt*180)); continue; }
+        const ack=await waiter.promise;
+        if(ack&&ack.ok&&Number(ack.idx)===i){
+          log('fragment '+(i+1)+'/'+total+' ACKed'+(attempt>1?' after '+attempt+' tries':''));
+          await sleep(Math.max(250,Math.min(interFragMs,700)));
+          return true;
+        }
+        if(ack&&ack.nak) log('fragment '+(i+1)+' NAK — immediate repair try '+(attempt+1),true);
+        else log('fragment '+(i+1)+' ACK timeout — repair try '+(attempt+1),true);
+        await sleep(Math.min(3000,450+attempt*220));
+      }
+      throw new Error('relay did not ACK fragment '+(i+1)+'/'+total+' after '+MAX_FRAG_ATTEMPTS+' attempts');
     }
 
     async function sendSet(indices, round){
@@ -25814,7 +25932,7 @@ try {
     if(!toUser) throw new Error('recipient required');
     if(clientMode) await omEnsureAudioForClient();
     const fromUser = senderUser();
-    const from = fromUser + '@open.mail';
+    const from = omOpenMailAddress(fromUser);
     setStatus('resolving '+toUser+' public id');
     const pubB64 = await lookupPublicKeyFast(toUser);
     if(!pubB64) throw new Error('recipient public id not found: '+toUser+'@open.mail');
@@ -25826,15 +25944,15 @@ try {
     setStatus('uploading encrypted filename records through relay');
     let res;
     try {
-      res = await uploadRecordsSmart(records, {bin:OM_SHARED_BIN});
+      res = await uploadRecordsSmart(records, {bin:omCurrentLogicalBin()});
     } catch(uploadErr1) {
       log('mail upload attempt 1 failed: '+((uploadErr1&&uploadErr1.message)||uploadErr1)+' — retrying', true);
       setStatus('send attempt 1 failed — retrying…');
       await sleep(2000);
-      res = await uploadRecordsSmart(records, {bin:OM_SHARED_BIN});
+      res = await uploadRecordsSmart(records, {bin:omCurrentLogicalBin()});
     }
     try{
-      OM.sent.unshift({to:toUser+'@open.mail', subject:subject || '(no subject)', body:body || '', date:Date.now(), snippet:S(body||'').replace(/\s+/g,' ').slice(0,90), eid:pack.eid, visible:true, method:'audio-interop'});
+      OM.sent.unshift({to:omOpenMailAddress(toUser), subject:subject || '(no subject)', body:body || '', date:Date.now(), snippet:S(body||'').replace(/\s+/g,' ').slice(0,90), eid:pack.eid, visible:true, method:'audio-interop'});
       OM.contacts[toUser] = pubB64;
       localStorage.setItem('acnet_openmail_contacts', JSON.stringify(OM.contacts));
     }catch(_){}
@@ -25867,12 +25985,12 @@ try {
     const passwordHash = await OMCrypto.sha256(password + salt);
     const aesKey = await OMCrypto.deriveAesFromPassword(password, salt);
     const encryptedPriv = await OMCrypto.encryptJson(privJwk, aesKey);
-    const cred = {version:2, username:user, salt, passwordHash, pubKeyB64:pubB64, encryptedPriv, createdAt:Date.now(), storage:'filename-chunks'};
+    const cred = {version:4, username:user, groupId:currentGroupId(), salt, passwordHash, pubKeyB64:pubB64, encryptedPriv, createdAt:Date.now(), accountDay:Math.floor(Date.now()/OM_DAY_MS), storage:'filename-chunks'};
     const pfx = omUserPrefix(user);
     const records = omMakeCredentialFilenames(cred).map(n => ({filename:pfx+n, content:'{}'}));
     records.push({filename:omMakeRegistryFilename(user, pubB64), content:'{}'});
     setStatus('publishing public id + credential filenames');
-    await uploadRecordsSmart(records, {bin:OM_SHARED_BIN});
+    await uploadRecordsSmart(records, {bin:omCurrentLogicalBin()});
     OM.contacts[user] = pubB64;
     try { localStorage.setItem('acnet_openmail_contacts', JSON.stringify(OM.contacts)); } catch(_) {}
     // Account created. Open from the freshly generated local credential instead
@@ -25881,7 +25999,7 @@ try {
     // creation retries with new keys.
     omCacheCredential(cred);
     await omOpenSessionFromCredential(user, password, cred, false);
-    omSetStatus('account created as '+user+'@open.mail');
+    omSetStatus('account created as '+omOpenMailAddress(user));
     renderOpenMailApp('openmail');
   };
   window.omSignup = omSignup;
@@ -25943,7 +26061,8 @@ try {
   'use strict';
   const FIX='ACNET_OPENMAIL_UPLOADED_REFERENCE_FIX46_2026_07_18';
   const LOGICAL_BIN='openmail';
-  const ROLLING_PREFIX='omr1';
+  const ROLLING_PREFIX='omr2';
+  const GROUP_PREFIX='openmail-g-';
   const NETWORK_SEED='openmail-fixed-rolling-2026';
   const LOOKBACK_DAYS=7;
   const DAY_MS=86400000;
@@ -25955,19 +26074,20 @@ try {
     for(let i=0;i<text.length;i++) h=Math.imul(h^text.charCodeAt(i),0x01000193)>>>0;
     return h.toString(36);
   }
-  function binForDayOffset(offset,nowMs){
-    const day=Math.floor(Number(nowMs===undefined?Date.now():nowMs)/DAY_MS)+Number(offset||0);
-    return ROLLING_PREFIX+'-'+fnv1a(NETWORK_SEED+':'+day)+fnv1a(day+':'+NETWORK_SEED);
+  function groupIdForBin(binId){ const s=S(binId||''); if(s.startsWith(GROUP_PREFIX)) return s.slice(GROUP_PREFIX.length); if(!s||s===LOGICAL_BIN) return (typeof currentGroupId==='function'?currentGroupId():''); return ''; }
+  function binForDayOffset(offset,nowMs,explicitGroupId){
+    const day=Math.floor(Number(nowMs===undefined?Date.now():nowMs)/DAY_MS)+Number(offset||0),gid=S(explicitGroupId||''),seed=gid?NETWORK_SEED+':group:'+gid:NETWORK_SEED,tag=gid?gid.slice(0,7)+'-':'';
+    return ROLLING_PREFIX+'-'+tag+fnv1a(seed+':'+day)+fnv1a(day+':'+seed);
   }
-  function activeBin(){ return binForDayOffset(0); }
+  function activeBin(binId){ return binForDayOffset(0,undefined,groupIdForBin(binId)); }
   function readBins(binId){
-    if(binId && S(binId)!==LOGICAL_BIN) return [S(binId)];
-    const out=[];
-    for(let i=0;i<=LOOKBACK_DAYS;i++) out.push(binForDayOffset(-i));
-    out.push(LOGICAL_BIN);
+    const s=S(binId||''),gid=groupIdForBin(s);
+    if(s && s!==LOGICAL_BIN && !s.startsWith(GROUP_PREFIX)) return [s];
+    const out=[]; for(let i=0;i<=LOOKBACK_DAYS;i++) out.push(binForDayOffset(-i,undefined,gid));
+    if(!gid) out.push(LOGICAL_BIN);
     return Array.from(new Set(out));
   }
-  function writeBin(binId){ return !binId || S(binId)===LOGICAL_BIN ? activeBin() : S(binId); }
+  function writeBin(binId){ const s=S(binId||''); return (!s||s===LOGICAL_BIN||s.startsWith(GROUP_PREFIX))?activeBin(s):s; }
   function accountDayKey(ts){ return Math.floor(Number(ts||0)/DAY_MS); }
   function currentAccountDay(now){ return accountDayKey(now===undefined?Date.now():now); }
   function credentialAccountDay(cred){
@@ -26004,7 +26124,8 @@ try {
   omCleanCredentialForStorage=function omCleanCredentialForStorageReference(cred){
     const c=baseCleanCredential(cred||{});
     c.accountDay=Number.isFinite(Number(cred&&cred.accountDay)) ? Number(cred.accountDay) : accountDayKey(cred&&cred.createdAt||Date.now());
-    c.version=Math.max(3,Number(c.version||3));
+    if(cred&&cred.groupId) c.groupId=S(cred.groupId);
+    c.version=Math.max(4,Number(c.version||4));
     c.storage='filename-chunks';
     return c;
   };
@@ -26127,23 +26248,26 @@ try {
 
   async function fetchStandaloneBodyCredential(user,binId){
     user=omCleanUser(user); if(!user) return null;
-    const prefix=omUserPrefix(user), filename=prefix+'cred-'+user;
-    for(const b of readBins(binId||LOGICAL_BIN)){
+    const logical=binId||LOGICAL_BIN, expectedGroup=groupIdForBin(logical);
+    const prefix=omUserPrefix(user), filename=prefix+'cred-'+user, bins=readBins(logical);
+    const found=await Promise.all(bins.map(async b=>{
       const url='https://filebin.net/'+encodeURIComponent(b)+'/'+encodeURIComponent(filename);
       let res=null;
       try{ res=await omRelayFetchWithTimeout(url,{method:'GET',credentials:'omit',mode:'cors',cache:'no-store'},12000,'Open.Mail credential body'); }
       catch(_){ try{ res=await tryFetch(url); }catch(__){ res=null; } }
-      if(!res) continue;
+      if(!res) return null;
       try{
         const text=await res.text();
-        if(!text||/^\s*(?:<!|<html|Title:\s*404)/i.test(text)) continue;
+        if(!text||/^\s*(?:<!|<html|Title:\s*404)/i.test(text)) return null;
         const cred=JSON.parse(text);
-        if(omCleanUser(cred&&cred.username)!==user) continue;
-        if(!credentialIsCurrent(cred)) continue;
+        if(omCleanUser(cred&&cred.username)!==user) return null;
+        if(cred&&cred.groupId&&expectedGroup&&cred.groupId!==expectedGroup) return null;
+        if(!credentialIsCurrent(cred)) return null;
         cred._source='standalone-body'; cred._bin=b;
         return cred;
-      }catch(_){}
-    }
+      }catch(_){ return null; }
+    }));
+    for(let i=0;i<found.length;i++) if(found[i]) return found[i];
     return null;
   }
 
@@ -26162,7 +26286,7 @@ try {
       const files=(result&&Array.isArray(result.files))?result.files:(result&&Array.isArray(result.f)?result.f:[]);
       const user=omPrefixUser(payload.prefix||'');
       let complete=null;
-      try{ complete=omReconstructCredentialsFromFiles(files,user); }catch(_){}
+      try{ complete=omReconstructCredentialsFromFiles(files,user,groupIdForBin(payload.bin||LOGICAL_BIN)); }catch(_){}
       if(user && (!complete || !credentialIsCurrent(complete))){
         const bodyCred=await fetchStandaloneBodyCredential(user,payload.bin||LOGICAL_BIN);
         if(bodyCred){
@@ -26234,14 +26358,14 @@ try {
     const passwordHash=await OMCrypto.sha256(password+salt);
     const aesKey=await OMCrypto.deriveAesFromPassword(password,salt);
     const encryptedPriv=await OMCrypto.encryptJson(privJwk,aesKey);
-    const cred=omCleanCredentialForStorage({version:3,username:user,salt,passwordHash,pubKeyB64:pubB64,encryptedPriv,createdAt,accountDay:currentAccountDay(createdAt),storage:'filename-chunks'});
+    const cred=omCleanCredentialForStorage({version:4,username:user,groupId:currentGroupId(),salt,passwordHash,pubKeyB64:pubB64,encryptedPriv,createdAt,accountDay:currentAccountDay(createdAt),storage:'filename-chunks'});
     const prefix=omUserPrefix(user);
     if(clientMode && typeof window.__omCompactAccountCreate==='function'){
       /* FIX49: one compact credential goes over sound. The relay creates every
          interoperable Filebin representation locally, so body JSON and ua-*
          filenames are never duplicated on-air. */
       omSetStatus('publishing compact Open.Mail identity through relay');
-      const receipt=await window.__omCompactAccountCreate(cred,{bin:LOGICAL_BIN});
+      const receipt=await window.__omCompactAccountCreate(cred,{bin:omCurrentLogicalBin()});
       if(!receipt || !receipt.committed) throw new Error('compact account create was not committed by relay');
     } else {
       const records=[
@@ -26250,12 +26374,12 @@ try {
         {filename:omMakeRegistryFilename(user,pubB64),content:'{}'}
       ];
       omSetStatus('publishing '+records.length+' interoperable Open.Mail record(s)');
-      if(typeof window.__omBatchUpload==='function') await window.__omBatchUpload(records,{bin:LOGICAL_BIN});
-      else for(const r of records){ await omUpload(r.filename,r.content,LOGICAL_BIN); await sleep(70); }
+      if(typeof window.__omBatchUpload==='function') await window.__omBatchUpload(records,{bin:omCurrentLogicalBin()});
+      else for(const r of records){ await omUpload(r.filename,r.content,omCurrentLogicalBin()); await sleep(70); }
     }
     omCacheCredential(cred); OM.contacts[user]=pubB64;
     await omOpenSessionFromCredential(user,password,cred,false);
-    omSetStatus('daily account created as '+user+'@open.mail');
+    omSetStatus('daily account created as '+omOpenMailAddress(user));
     scheduleDailyExpiry();
     try{ renderOpenMailApp('openmail'); }catch(_){}
     return true;
@@ -26294,23 +26418,25 @@ try {
 
   async function sendEmailReference(to,subject,body){
     if(!OM.priv||!OM.user) throw new Error('not logged in');
-    const toUser=omCleanUser(S(to).replace(/^mailto:/i,'').replace(/@open\.mail$/i,''));
-    if(!toUser) throw new Error('recipient required');
+    const parsedTo=omParseOpenMailAddress(S(to).replace(/^mailto:/i,''));
+    if(!parsedTo||!parsedTo.user) throw new Error('use user@group.open.mail or username');
+    if(parsedTo.group&&parsedTo.group!==currentGroup) throw new Error('recipient is in group '+parsedTo.group+'; current group is '+currentGroup);
+    const toUser=parsedTo.user;
     if(clientMode) await omEnsureAudioForClient();
     omSetStatus('resolving '+toUser+' public key');
     const pubB64=await omLookupPublicKeyB64(toUser);
     if(!pubB64) throw new Error('recipient public key not found: '+toUser+'@open.mail');
     const pub=await OMCrypto.importPublicRaw(omB64UrlToBytes(pubB64));
     const prefix=omUserPrefix(toUser);
-    const pack=await encryptMailFitting(pub,OM.user+'@open.mail',subject||'(no subject)',body||'',Date.now(),prefix);
+    const pack=await encryptMailFitting(pub,omOpenMailAddress(OM.user),subject||'(no subject)',body||'',Date.now(),prefix);
     const records=[prefix+pack.header,...pack.chunks.map(x=>prefix+x)].map(filename=>({filename,content:'{}'}));
     omSetStatus('uploading '+records.length+' encrypted filename record(s)');
     let res;
-    if(typeof window.__omBatchUpload==='function') res=await window.__omBatchUpload(records,{bin:LOGICAL_BIN});
-    else { for(const r of records){ await omUpload(r.filename,r.content,LOGICAL_BIN); await sleep(70); } res={ok:true,uploaded:records.length}; }
-    OM.sent.unshift({to:toUser+'@open.mail',subject:subject||'(no subject)',body:body||'',date:Date.now(),snippet:S(body||'').replace(/\s+/g,' ').slice(0,90),eid:pack.eid,visible:true,method:'reference-compat'});
+    if(typeof window.__omBatchUpload==='function') res=await window.__omBatchUpload(records,{bin:omCurrentLogicalBin()});
+    else { for(const r of records){ await omUpload(r.filename,r.content,omCurrentLogicalBin()); await sleep(70); } res={ok:true,uploaded:records.length}; }
+    OM.sent.unshift({to:omOpenMailAddress(toUser),subject:subject||'(no subject)',body:body||'',date:Date.now(),snippet:S(body||'').replace(/\s+/g,' ').slice(0,90),eid:pack.eid,visible:true,method:'reference-compat'});
     OM.contacts[toUser]=pubB64;
-    omSetStatus('sent to '+toUser+'@open.mail');
+    omSetStatus('sent to '+omOpenMailAddress(toUser));
     try{ renderOpenMailApp('openmail/sent'); }catch(_){}
     return res;
   }
@@ -26326,19 +26452,21 @@ try {
       omRelayListMailbox,omRelayUploadFile,omRelayApi,omList,omUpload,omSignup,omLogin,omSendEmail,renderOpenMailApp,navTo});
   }catch(_){}
 
-  window.openMailBinForDayOffset=binForDayOffset;
-  window.openMailActiveBin=activeBin;
-  window.openMailResolveReadBins=readBins;
-  window.openMailResolveWriteBin=writeBin;
+  window.openMailBinForDayOffset=openMailBinForDayOffset;
+  window.openMailActiveBin=openMailActiveBin;
+  window.openMailResolveReadBins=openMailResolveReadBins;
+  window.openMailResolveWriteBin=openMailResolveWriteBin;
+  window.openMailGroupId=openMailGroupId;
+  window.openMailGroupLogicalBin=openMailGroupLogicalBin;
   window.accountDayKey=accountDayKey;
   window.currentAccountDay=currentAccountDay;
   window.isCredentialCurrentDay=credentialIsCurrent;
 
   window.OpenMailACNETCrossCompat={
-    version:FIX,reference:'openmail_daily_account_reset_nosavedusers_registryfix14_acnet_xcompat-2.html',logicalBin:LOGICAL_BIN,activeBin,readBins:()=>readBins(LOGICAL_BIN),userPrefix:omUserPrefix,
+    version:FIX,reference:'openmail_daily_account_reset_nosavedusers_registryfix14_acnet_xcompat-2.html',logicalBin:LOGICAL_BIN,groupLogicalBin:()=>omCurrentLogicalBin(),activeBin:()=>openMailActiveBin(omCurrentLogicalBin()),readBins:()=>openMailResolveReadBins(omCurrentLogicalBin()),userPrefix:omUserPrefix,
     credentialPrefix:OM_CRED_FN_PREFIX,credentialChunkBudget:OM_CRED_FN_CHUNK_BUDGET,mailChunkBudget:OM_CHUNK_RAW_BUDGET,registryPrefix:'reg2-',
-    listViaACNET:async function(user,scope,opts){ opts=opts||{}; return await omList(LOGICAL_BIN,omUserPrefix(user),{scope:scope||'mail',limit:opts.limit||24,compact:opts.compact!==false}); },
-    uploadViaACNET:async function(filename,content,bin){ return await omUpload(filename,content==null?'{}':content,bin||LOGICAL_BIN); },
+    listViaACNET:async function(user,scope,opts){ opts=opts||{}; return await omList(omCurrentLogicalBin(),omUserPrefix(user),{scope:scope||'mail',limit:opts.limit||24,compact:opts.compact!==false}); },
+    uploadViaACNET:async function(filename,content,bin){ return await omUpload(filename,content==null?'{}':content,bin||omCurrentLogicalBin()); },
     selfTest:function(){
       const now=Date.UTC(2026,6,17,12,0,0),user='test_user-1',pub='A'.repeat(10)+'-'+ 'B'.repeat(32);
       const reg=omParseRegistryFilename('reg2-'+now.toString(36)+'-'+omStrToB64Url(user)+'-'+pub);
@@ -26347,8 +26475,9 @@ try {
       const rec=omReconstructCredentialsFromFiles(names.map(n=>({name:'u.test-user-1.'+n})),user);
       let b64=true;
       try{ for(let n=1;n<=64;n++){ const a=new Uint8Array(n); for(let i=0;i<n;i++)a[i]=(i*31+n)&255; const b=omB64UrlToBytes(omBytesToB64Url(a)); if(b.length!==a.length||b.some((v,i)=>v!==a[i])){b64=false;break;} } }catch(_){ b64=false; }
-      const ok=activeBin()===binForDayOffset(0)&&readBins(LOGICAL_BIN).length===LOOKBACK_DAYS+2&&omUserPrefix(user)==='u.test-user-1.'&&reg&&reg.uname===user&&reg.pubB64===pub&&rec&&rec.username===user&&credentialIsCurrent(cred,now)&&b64&&window.OM===OM&&typeof window.omRelayApi==='function';
-      return {ok,fix:FIX,activeBin:activeBin(),readBinCount:readBins(LOGICAL_BIN).length,prefix:omUserPrefix(user),registryUser:reg&&reg.uname,credentialChunks:names.length,credentialDay:cred.accountDay,b64,globals:window.OM===OM};
+      const gid=openMailGroupId('alpha'),groupBin=GROUP_PREFIX+gid,groupReads=readBins(groupBin);
+      const ok=activeBin(groupBin)===binForDayOffset(0,undefined,gid)&&groupReads.length===LOOKBACK_DAYS+1&&!groupReads.includes(LOGICAL_BIN)&&omUserPrefix(user)==='u.test-user-1.'&&reg&&reg.uname===user&&reg.pubB64===pub&&rec&&rec.username===user&&credentialIsCurrent(cred,now)&&b64&&window.OM===OM&&typeof window.omRelayApi==='function';
+      return {ok,fix:FIX,groupBin,activeBin:activeBin(groupBin),readBinCount:groupReads.length,prefix:omUserPrefix(user),registryUser:reg&&reg.uname,credentialChunks:names.length,credentialDay:cred.accountDay,b64,globals:window.OM===OM};
     }
   };
   window.ACNET_OPENMAIL_REFERENCE_COMPAT=window.OpenMailACNETCrossCompat;
@@ -26439,18 +26568,30 @@ try {
       onRxPacket._relayAbortTransfer=false;
       try{
         const res=await omWithTimeout(Promise.resolve(omRelayApi(payload)),18000,'Open.Mail fragment ingest');
-        const idx=payload.idx!==undefined?payload.idx:payload.i;
-        const total=payload.total!==undefined?payload.total:payload.t;
-        if(res&&res.ack===false) log48('relay rejected corrupt fragment '+idx+'/'+total+'; commit repair will request it',true);
+        const idx=Number(payload.idx!==undefined?payload.idx:payload.i);
+        const total=Number(payload.total!==undefined?payload.total:payload.t);
+        const sid=String(payload.sid||payload.s||'').replace(/[^A-Za-z0-9_-]/g,'').slice(0,16);
+        const received=Number(res&&res.received||0);
+        const good=!!(res&&res.ack!==false&&res.ok!==false);
+        if(!good) log48('relay rejected fragment '+(idx+1)+'/'+total+' — sending NAK',true);
         else {
-          try{ bStat.textContent='✓ Open.Mail fragment '+(Number(idx)+1)+'/'+total; }catch(_){}
-          log48('relay stored fragment '+(Number(idx)+1)+'/'+total+' (no response TX)');
+          try{ bStat.textContent='✓ Open.Mail fragment '+(idx+1)+'/'+total+' · ACK'; }catch(_){}
+          log48('relay stored fragment '+(idx+1)+'/'+total+' — ACK TX');
         }
+        // Give the client decoder time to leave its TX echo gate, then send one
+        // tiny control frame.  Duplicate fragment reception simply produces
+        // another ACK, which is exactly what we want when the prior ACK was lost.
+        const sr=Math.max(1,Number(CFG&&CFG.symbolRate)||10);
+        const turn=(CFG&&CFG.mod==='ggwave')?260:(sr>=30?320:sr>=20?460:700);
+        try{ await relaySleepCtx(turn); }catch(_){}
+        const ctl=(good?'OMFACK1 ':'OMFNAK1 ')+sid+' '+idx+(good?(' '+received+'.'+total):'');
+        try{ await transmit(ctl,false); }
+        catch(txErr){ log48('fragment '+(idx+1)+' ACK/NAK TX error: '+((txErr&&txErr.message)||txErr),true); }
       }catch(e){
         log48('relay fragment ingest error: '+((e&&e.message)||e),true);
       }finally{
-        /* Only decoder/room settling; never the multi-second response cooldown. */
-        try{ await relaySleepCtx((CFG&&CFG.mod==='ggwave')?220:140); }catch(_){}
+        /* ACK itself is the turnaround/settling interval; keep only a short tail. */
+        try{ await relaySleepCtx((CFG&&CFG.mod==='ggwave')?180:120); }catch(_){}
         onRxPacket._relayAbortTransfer=false;
         onRxPacket._relayBusy=false;
         onRxPacket._relayUrl=null;
@@ -26468,7 +26609,7 @@ try {
     const baseOmRpc48=omRpc;
     omRpc=async function omRpcSendFix48(payload){
       const op=op48(payload);
-      if(clientMode&&uploadActive>0&&op!=='ucommit'&&op!=='uc'){
+      if(clientMode&&uploadActive>0&&op!=='ucommit'&&op!=='uc'&&!isFragOp48(op)){
         const started=Date.now();
         let announced=false;
         while(uploadActive>0){
@@ -26511,7 +26652,7 @@ try {
         const wire=omBuildRpcWire({op:'ufrag',sid:'s48',idx:1,total:3,data:'abc|'+crc16String('abc'),callSight:'TEST-17'});
         const p=omParseRpcKvPayload(wire);
         const resolved=(typeof window.openMailResolveWriteBin==='function')?window.openMailResolveWriteBin('openmail'):'openmail';
-        return {ok:!!(p&&p.op==='ufrag'&&p.idx===1&&p.total===3&&p.data==='abc|'+crc16String('abc')&&typeof processOpenMailRelayRequest==='function'&&resolved!=='openmail'),version:FIX,fragment:p,writeBin:resolved,queueCapacity:64,fastFragmentIngest:true,uploadTransactionLock:true};
+        return {ok:!!(p&&p.op==='ufrag'&&p.idx===1&&p.total===3&&p.data==='abc|'+crc16String('abc')&&typeof processOpenMailRelayRequest==='function'&&resolved!=='openmail'),version:FIX,fragment:p,writeBin:resolved,queueCapacity:64,fastFragmentIngest:true,perFragmentAck:true,finalMissingRepair:true,uploadTransactionLock:true};
       }
     };
     // Startup send-fix48 notice intentionally hidden; send-fix48 remains active.
@@ -30689,5 +30830,9 @@ window.ACNET_2FSK_ADVANCED={version:'2FSK-ADV1',wireCompatible:true,tones:[1000,
 </script>
 <script type="application/json" id="acnet-sstv-video-ggwave-replacement">{"patch":"SSTV_VIDEO_GGWAVE_REPLACEMENT","source":"acnet_video_ggwave.html","target":"ACNET_2-4fsk_ggwave_amateur_radio(2).html","sstv_module":"ACNET v7.3-pd290-profix","mode":"PD290 VIS 94 800x616 YCbCr","scope":["SSTV CSS","SSTV panel markup","complete SSTV encoder/decoder module"],"source_sstv_sha256":"02d8cfa921636f807fecb1607adedcc90429ebeabf25dec5aeb5fdad41d23c77"}</script>
 <script type="application/json" id="acnet-dtmf-web-manifest">{"patch":"DTMF-WEB-R1","release":"ACNET V2.2","keypad":"12-key DTMF","rows_hz":[697,770,852,941],"columns_hz":[1209,1336,1477],"encoding":"octal 3-bit symbols","framing":"start/end + version + sequence + length + CRC-16/CCITT","tone_ms":70,"gap_ms":50,"raw_bps":25,"web":"existing Client/Relay browser with text-first pages and links","web_body_cap_bytes":1024,"chunk_payload_bytes":36,"pd290_analyser_teardown_guard":true}</script>
+
+<script id="acnet-openmail-frag-ack-fix59-marker">
+window.ACNET_OPENMAIL_FRAGMENT_ACK_REPAIR={version:'FIX59-STOP-AND-CONFIRM',perFragmentAck:true,compactAck:'OMFACK1',compactNak:'OMFNAK1',maxFragmentAttempts:18,finalCommitRepair:true,selfTest:function(){return {ok:!!(window.__omFragAckWaiters&&typeof processOpenMailRelayRequest==='function'),perFragmentAck:true,finalCommitRepair:true};}};
+</script>
 </body>
 </html>

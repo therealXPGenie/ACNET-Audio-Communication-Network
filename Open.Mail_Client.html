@@ -6,8 +6,8 @@
 <!-- Open.Mail Fixed Edition: cache-buster removed, Cache-Control header cleaned,
      all robustness features preserved (pad===3 check, prefix stripping, CRC handling,
      contact cache, credential fallback, ACNET bridge). Compatible with ACNET FIX43+.
-     Version: 2026.07.15-filebin-rolling-recovery -->
-<title>Open.Mail — Filebin Rolling Recovery</title>
+     Version: 2026.09.06-group-address-v2 -->
+<title>Open.Mail</title>
 <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -267,6 +267,10 @@ textarea:focus{border-color:var(--g1);outline:none}
     <div class="login-box-body">
       <div id="login-mode">
         <div class="input-group">
+          <label>Group</label>
+          <input type="text" id="login-group" placeholder="your_group" autocomplete="off" spellcheck="false" oninput="mirrorGroupInput(this.value,'signup-group')">
+        </div>
+        <div class="input-group">
           <label>Username</label>
           <input type="text" id="login-user" placeholder="your_username" autocomplete="off" spellcheck="false">
         </div>
@@ -278,6 +282,10 @@ textarea:focus{border-color:var(--g1);outline:none}
         <p class="note"><a href="#" onclick="toggleAuthMode();return false">Create an account &rarr;</a></p>
       </div>
       <div id="signup-mode" style="display:none">
+        <div class="input-group">
+          <label>Group</label>
+          <input type="text" id="signup-group" placeholder="your_group" autocomplete="off" spellcheck="false" oninput="mirrorGroupInput(this.value,'login-group')">
+        </div>
         <div class="input-group">
           <label>Username</label>
           <input type="text" id="signup-user" placeholder="your_username" autocomplete="off" spellcheck="false">
@@ -306,9 +314,10 @@ textarea:focus{border-color:var(--g1);outline:none}
         <button type="button" type="button" class="btn" onclick="doSignup()">&#9654; Create Account</button>
         <p class="note"><a href="#" onclick="toggleAuthMode();return false">&larr; Already have an account</a></p>
       </div>
+      <p class="note">Group names have no password. Enter the group name directly; a group link is optional.</p>
       <p class="note">Private key never leaves your device.</p>
     </div>
-    <div class="login-box-foot">rolling Filebin bins &middot; verified uploads &middot; ~6 day message retention</div>
+    <div class="login-box-foot">group-isolated rolling Filebin bins &middot; verified uploads &middot; ~6 day message retention</div>
   </div>
 </div>
 
@@ -318,8 +327,10 @@ textarea:focus{border-color:var(--g1);outline:none}
     <div class="sidebar-header">
       <h2>Open.Mail</h2>
       <div class="addr" id="account-addr">&hellip;</div>
+      <div class="addr" id="group-addr">group: &hellip;</div>
       <div class="e2e-pill">&#128274; E2E</div>
       <button type="button" class="addr-btn" onclick="copyAddr()">Copy Address</button>
+      <button type="button" class="addr-btn" onclick="copyGroupLink()">Copy Group Link</button>
     </div>
     <button type="button" class="nav-btn active" id="nav-inbox" onclick="showInbox()"><span>&#128231;</span> <span>Inbox</span></button>
     <button type="button" class="nav-btn" id="nav-compose" onclick="openCompose()"><span>&#9998;</span> <span>Compose</span></button>
@@ -404,7 +415,7 @@ textarea:focus{border-color:var(--g1);outline:none}
     <div style="padding:16px 22px 0">
       <div class="compose-field">
         <label>To (Username)</label>
-        <input type="text" id="compose-to" placeholder="recipient_username">
+        <input type="text" id="compose-to" placeholder="user@group.open.mail">
       </div>
       <div class="compose-field">
         <label>Subject</label>
@@ -469,37 +480,66 @@ const SRV = 'https://filebin.net';
    bin, the previous seven UTC-day bins, and the old legacy bin. All clients
    can independently calculate the same bin names without a central pointer. */
 const OPENMAIL_LOGICAL_BIN = 'openmail';
-const OPENMAIL_ROLLING_PREFIX = 'omr1';
+const OPENMAIL_GROUP_LOGICAL_PREFIX = 'openmail-g-';
+const OPENMAIL_ROLLING_PREFIX = 'omr2';
 const OPENMAIL_NETWORK_SEED = 'openmail-fixed-rolling-2026';
 const OPENMAIL_LOOKBACK_DAYS = 7;
 const OPENMAIL_DAY_MS = 24 * 60 * 60 * 1000;
+let currentGroup = '';
 function openMailFnv1a(text) {
   let h=0x811c9dc5;
   text=String(text||'');
   for(let i=0;i<text.length;i++) h=Math.imul(h^text.charCodeAt(i),0x01000193)>>>0;
   return h.toString(36);
 }
-function openMailBinForDayOffset(offset, nowMs) {
-  const day = Math.floor((Number(nowMs || Date.now())) / OPENMAIL_DAY_MS) + Number(offset || 0);
-  // Opaque deterministic name: all compatible clients calculate it, while it
-  // is less likely to be casually discovered and locked than `openmail-<day>`.
-  return OPENMAIL_ROLLING_PREFIX + '-' + openMailFnv1a(OPENMAIL_NETWORK_SEED+':'+day) + openMailFnv1a(day+':'+OPENMAIL_NETWORK_SEED);
+function normalizeGroupName(value) {
+  return String(value||'').trim().toLowerCase().replace(/\s+/g,'-').replace(/[^a-z0-9_-]/g,'').replace(/^-+|-+$/g,'').slice(0,32);
 }
-function openMailActiveBin() { return openMailBinForDayOffset(0); }
-function openMailCandidateBins(includeLegacy) {
+function openMailGroupId(groupName) {
+  const g=normalizeGroupName(groupName);
+  if(!g) return '';
+  return openMailFnv1a('openmail-group:'+g)+openMailFnv1a(g+':openmail-group');
+}
+function openMailGroupLogicalBin(groupName) {
+  const gid=openMailGroupId(groupName===undefined?currentGroup:groupName);
+  return gid ? OPENMAIL_GROUP_LOGICAL_PREFIX+gid : OPENMAIL_LOGICAL_BIN;
+}
+function openMailGroupIdForBin(binId) {
+  const s=String(binId||'');
+  if(s.startsWith(OPENMAIL_GROUP_LOGICAL_PREFIX)) return s.slice(OPENMAIL_GROUP_LOGICAL_PREFIX.length);
+  if(!s || s===OPENMAIL_LOGICAL_BIN) return openMailGroupId(currentGroup);
+  return '';
+}
+function openMailBinForDayOffset(offset, nowMs, explicitGroupId) {
+  const day = Math.floor((Number(nowMs || Date.now())) / OPENMAIL_DAY_MS) + Number(offset || 0);
+  const gid=String(explicitGroupId||openMailGroupId(currentGroup)||'');
+  // Group-scoped bins are opaque: the plaintext group name never appears in Filebin.
+  // The group hash and UTC day together deterministically select the rolling bin.
+  const seed=gid ? OPENMAIL_NETWORK_SEED+':group:'+gid : OPENMAIL_NETWORK_SEED;
+  const groupTag=gid ? gid.slice(0,7)+'-' : '';
+  return OPENMAIL_ROLLING_PREFIX + '-' + groupTag + openMailFnv1a(seed+':'+day) + openMailFnv1a(day+':'+seed);
+}
+function openMailActiveBin(binId) { return openMailBinForDayOffset(0, undefined, openMailGroupIdForBin(binId)); }
+function openMailCandidateBins(includeLegacy, binId) {
   const out = [];
-  for (let i = 0; i <= OPENMAIL_LOOKBACK_DAYS; i++) out.push(openMailBinForDayOffset(-i));
-  if (includeLegacy !== false) out.push(OPENMAIL_LOGICAL_BIN);
+  const gid=openMailGroupIdForBin(binId);
+  for (let i = 0; i <= OPENMAIL_LOOKBACK_DAYS; i++) out.push(openMailBinForDayOffset(-i, undefined, gid));
+  // Never merge the old global bin into a named group: that would defeat isolation.
+  if (!gid && includeLegacy !== false) out.push(OPENMAIL_LOGICAL_BIN);
   return Array.from(new Set(out));
 }
 function openMailResolveWriteBin(binId) {
-  return !binId || binId === OPENMAIL_LOGICAL_BIN ? openMailActiveBin() : String(binId);
+  const s=String(binId||'');
+  if(!s || s===OPENMAIL_LOGICAL_BIN || s.startsWith(OPENMAIL_GROUP_LOGICAL_PREFIX)) return openMailActiveBin(s);
+  return s;
 }
 function openMailResolveReadBins(binId) {
-  return !binId || binId === OPENMAIL_LOGICAL_BIN ? openMailCandidateBins(true) : [String(binId)];
+  const s=String(binId||'');
+  if(!s || s===OPENMAIL_LOGICAL_BIN || s.startsWith(OPENMAIL_GROUP_LOGICAL_PREFIX)) return openMailCandidateBins(true,s);
+  return [s];
 }
 
-const REGISTRY_BIN = OPENMAIL_LOGICAL_BIN; // logical alias; reads span rolling bins
+const REGISTRY_BIN = OPENMAIL_LOGICAL_BIN; // resolved inside the active group
 const FBN_MAX_NAME = 120;
 
 /* ------------------------------------------------------------
@@ -575,6 +615,71 @@ let emails = [], sentMails = [];
 let currentEmailIdx = null, currentFolder = 'inbox';
 let selectedAttachments = [];
 let currentAttachments = []; // parsed attachments for the currently open email
+
+function currentGroupId(){ return openMailGroupId(currentGroup); }
+function openMailAddress(user, groupName){
+  const u=String(user||'').trim().toLowerCase().replace(/[^a-z0-9_-]/g,'');
+  const g=normalizeGroupName(groupName===undefined?currentGroup:groupName);
+  return u && g ? u+'@'+g+'.open.mail' : (u ? u+'@open.mail' : '');
+}
+function parseOpenMailAddress(value){
+  const raw=String(value||'').trim();
+  const m=raw.match(/^([a-z0-9_-]{1,32})@([a-z0-9_-]{1,32})\.open\.mail$/i);
+  if(m) return {user:m[1].toLowerCase(),group:normalizeGroupName(m[2]),full:true};
+  if(/^[a-z0-9_-]{1,32}$/i.test(raw)) return {user:raw.toLowerCase(),group:currentGroup,full:false};
+  return null;
+}
+function mirrorGroupInput(value, otherId){
+  const other=document.getElementById(otherId);
+  if(other && other.value!==value) other.value=value;
+}
+function groupFromUrl(){
+  try{
+    const u=new URL(location.href);
+    return normalizeGroupName(u.searchParams.get('group')||'');
+  }catch(_){ return ''; }
+}
+function rememberLastGroup(groupName){
+  try{ if(groupName) localStorage.setItem('openmail_last_group',groupName); }catch(_){}
+}
+function readLastGroup(){
+  try{ return normalizeGroupName(localStorage.getItem('openmail_last_group')||''); }catch(_){ return ''; }
+}
+function syncGroupToUrl(groupName){
+  const g=normalizeGroupName(groupName);
+  if(!g) return;
+  try{
+    const u=new URL(location.href);
+    u.searchParams.set('group',g);
+    history.replaceState(null,'',u.href);
+  }catch(_){}
+}
+function setActiveGroup(groupName,{remember=true,syncUrl=true}={}){
+  const g=normalizeGroupName(groupName);
+  if(!g) throw new Error('Group required');
+  currentGroup=g;
+  const lg=document.getElementById('login-group'), sg=document.getElementById('signup-group');
+  if(lg) lg.value=g; if(sg) sg.value=g;
+  if(remember) rememberLastGroup(g);
+  if(syncUrl) syncGroupToUrl(g);
+  const ga=document.getElementById('group-addr'); if(ga) ga.textContent='group: '+g;
+  return g;
+}
+function initializeGroupSelection(){
+  const g=groupFromUrl() || readLastGroup() || currentGroup;
+  if(g){ try{ setActiveGroup(g,{remember:false,syncUrl:false}); }catch(_){} }
+}
+function groupShareUrl(){
+  const g=normalizeGroupName(currentGroup);
+  if(!g) return '';
+  try{ const u=new URL(location.href); u.searchParams.set('group',g); return u.href; }catch(_){ return ''; }
+}
+async function copyGroupLink(){
+  const url=groupShareUrl();
+  if(!url) return toast('No group selected','warn');
+  try{ await navigator.clipboard.writeText(url); toast('Group link copied','success'); }
+  catch(_){ prompt('Copy group link:',url); }
+}
 
 /* ============================================================
    ENCODING HELPERS
@@ -777,8 +882,8 @@ async function decryptEmail(headerEntry, chunkEntries, myPriv) {
 function getSavedUsernames() { return []; }
 function addSavedUsername() {}
 function removeSavedUsername() {}
-function getEncBlobKey(uname) { return 'openmail_blob_'+uname; }
-function getRecoveryKey(uname) { return 'openmail_recovery_'+String(uname||'').toLowerCase(); }
+function getEncBlobKey(uname) { return 'openmail_blob_'+(currentGroupId()||'nogroup')+'_'+String(uname||'').toLowerCase(); }
+function getRecoveryKey(uname) { return 'openmail_recovery_'+(currentGroupId()||'nogroup')+'_'+String(uname||'').toLowerCase(); }
 function saveLocalCredentialRecovery() { return false; }
 function readLocalCredentialRecovery() { return null; }
 function purgeSavedUserData() {
@@ -808,7 +913,7 @@ const CRED_FN_CHUNK_BUDGET = 72; // conservative: keeps every auth filename belo
 
 function cleanCredentialForStorage(cred) {
   const c = {};
-  ['version','username','salt','passwordHash','pubKeyB64','encryptedPriv','createdAt','accountDay','storage'].forEach(k => {
+  ['version','username','groupId','salt','passwordHash','pubKeyB64','encryptedPriv','createdAt','accountDay','storage'].forEach(k => {
     if (cred && cred[k] !== undefined) c[k] = cred[k];
   });
   c.version = Math.max(2, Number(c.version || 2));
@@ -873,6 +978,7 @@ function reconstructCredentialsFromFiles(files, wantedUser) {
       const raw = b64UrlToStr(payload);
       const cred = JSON.parse(raw);
       if (!cred || String(cred.username || '').toLowerCase() !== String(wantedUser || '').toLowerCase()) return;
+      if (cred.groupId && cred.groupId !== currentGroupId()) return;
       cred._source = 'filename';
       cred._cid = cid;
       cred._filenames = g.filenames;
@@ -898,6 +1004,7 @@ async function fetchCredentialBodyFromBin(uname, bin, sourceLabel) {
     if (!t || t.trim().startsWith('<') || t.trim().startsWith('Title:') || t.trim().startsWith('<!')) return null;
     const cred = JSON.parse(t);
     if (String(cred.username || '').toLowerCase() !== String(uname || '').toLowerCase()) return null;
+    if (cred.groupId && cred.groupId !== currentGroupId()) return null;
     cred._source = sourceLabel || 'body';
     cred._bin = bin;
     dbg(`CRED body: OK from ${bin}`, 'ok');
@@ -995,6 +1102,8 @@ async function uploadCredential(uname, credObj) {
    ============================================================ */
 function toggleAuthMode() {
   const lm=document.getElementById('login-mode'), sm=document.getElementById('signup-mode');
+  const lg=document.getElementById('login-group'), sg=document.getElementById('signup-group');
+  if(lg&&sg){ if(lm.style.display==='none') lg.value=sg.value; else sg.value=lg.value; }
   if(lm.style.display==='none'){lm.style.display='block';sm.style.display='none';}
   else{lm.style.display='none';sm.style.display='block';}
 }
@@ -1009,6 +1118,11 @@ async function doSignup() {
   const btn=document.querySelector('#signup-mode .btn');
   if(btn) { btn.disabled=true; btn.textContent='Creating\u2026'; }
   try {
+    const groupVal=document.getElementById('signup-group').value;
+    const groupName=normalizeGroupName(groupVal);
+    if(!groupName) return toast('Group required','error');
+    if(groupName.length>32) return toast('Group max 32 characters','error');
+    setActiveGroup(groupName);
     const userVal=document.getElementById('signup-user').value.trim().toLowerCase();
     const password=document.getElementById('signup-pass').value;
     const confirm=document.getElementById('signup-confirm').value;
@@ -1042,7 +1156,7 @@ async function doSignup() {
     const encryptedPriv=await CRYPTO.encryptJson(privJwk,aesKey); // string
 
     const createdAt=Date.now();
-    const credObj={version:3, username:userVal, salt, passwordHash:passHash, pubKeyB64:pubB64, encryptedPriv, createdAt, accountDay:currentAccountDay(createdAt)};
+    const credObj={version:4, username:userVal, groupId:currentGroupId(), salt, passwordHash:passHash, pubKeyB64:pubB64, encryptedPriv, createdAt, accountDay:currentAccountDay(createdAt)};
 
     toast('Uploading credentials\u2026','warn');
     await uploadCredential(userVal, credObj);
@@ -1072,9 +1186,12 @@ async function doLogin() {
   const btn=document.querySelector('#login-mode .btn');
   if(btn) { btn.disabled=true; btn.textContent='Logging in\u2026'; }
   try {
+    const groupName=normalizeGroupName(document.getElementById('login-group').value);
     const userVal=document.getElementById('login-user').value.trim().toLowerCase();
     const password=document.getElementById('login-pass').value;
+    if(!groupName) return toast('Group required','error');
     if(!userVal||!password) return toast('Username and password required','error');
+    setActiveGroup(groupName);
     await doLoginInternal(userVal,password);
   } finally{ _loginBusy=false; if(btn){btn.disabled=false;btn.textContent='\u25b6 Log In';} }
 }
@@ -1083,6 +1200,8 @@ async function openSessionFromCredential(userVal, password, cred) {
     throw new Error('Credential record is incomplete or corrupt');
   if(!isCredentialCurrentDay(cred))
     throw new Error('Account expired at 00:00 UTC — recreate this account for today');
+  if(cred.groupId && cred.groupId!==currentGroupId())
+    throw new Error('Account belongs to a different group');
 
   const hash=await CRYPTO.sha256(password+cred.salt);
   if(hash!==cred.passwordHash) throw new Error('Invalid password');
@@ -1094,7 +1213,7 @@ async function openSessionFromCredential(userVal, password, cred) {
 
   myPrivateKey=await CRYPTO.importPrivateJwk(privJwk);
   myPublicKeyB64=cred.pubKeyB64;
-  currentUser={username:userVal, pubKeyB64:cred.pubKeyB64, createdAt:cred.createdAt, accountDay:credentialAccountDay(cred), credential:cred};
+  currentUser={username:userVal, group:currentGroup, groupId:currentGroupId(), pubKeyB64:cred.pubKeyB64, createdAt:cred.createdAt, accountDay:credentialAccountDay(cred), credential:cred};
   username=userVal;
 
   // Refresh the account into today's rolling bin whenever login came from an
@@ -1120,11 +1239,12 @@ async function openSessionFromCredential(userVal, password, cred) {
   await loadUserData();
   document.getElementById('login-view').style.display='none';
   document.getElementById('mail-view').style.display='flex';
-  document.querySelector('.sidebar-header .addr').textContent=username+'@open.mail';
+  document.getElementById('account-addr').textContent=openMailAddress(username);
+  const groupEl=document.getElementById('group-addr'); if(groupEl) groupEl.textContent='group: '+currentGroup;
   renderInbox();
   try { await refreshInbox(); } catch(e) { dbg('Inbox refresh: '+e.message, 'warn'); }
   startRefresh(); startSessionTimer(); startDailyAccountExpiryTimer();
-  toast('Welcome, '+username+' (valid until 00:00 UTC)','success');
+  toast('Welcome, '+openMailAddress(username)+' (valid until 00:00 UTC)','success');
 }
 
 async function doLoginInternal(userVal, password) {
@@ -1162,12 +1282,13 @@ function doLock() {
   document.getElementById('mail-view').style.display='none';
   document.getElementById('login-view').style.display='flex';
   if(username) document.getElementById('login-user').value=username;
+  const lg=document.getElementById('login-group'); if(lg) lg.value=currentGroup;
   document.getElementById('login-pass').value=''; document.getElementById('login-pass').focus();
   toast('Session locked. Enter password to unlock.','warn');
 }
 function doLogout() {
   myPrivateKey=null;sessionAesKey=null;stopRefresh();clearTimeout(sessionTimeout);clearTimeout(dailyExpiryTimeout);emails=[];sentMails=[];
-  if(username){ localStorage.removeItem(getEncBlobKey(username)); localStorage.removeItem('openmail_queue_'+username); }
+  if(username){ localStorage.removeItem(getEncBlobKey(username)); localStorage.removeItem(queueStorageKey()); }
   currentUser=null; username=null;
   document.getElementById('mail-view').style.display='none';
   document.getElementById('login-view').style.display='flex';
@@ -1195,8 +1316,8 @@ function startDailyAccountExpiryTimer() {
     const lm=document.getElementById('login-mode'), sm=document.getElementById('signup-mode');
     if(lm) lm.style.display='none';
     if(sm) sm.style.display='block';
-    const su=document.getElementById('signup-user');
-    if(su) su.value=expiredUser||'';
+    const su=document.getElementById('signup-user'), sg=document.getElementById('signup-group');
+    if(su) su.value=expiredUser||''; if(sg) sg.value=currentGroup||'';
     toast('Daily account expired. Recreate '+expiredUser+' for the new UTC day.','warn');
   }, msUntilNextUtcDay());
 }
@@ -1208,8 +1329,8 @@ function enforceDailyAccountBoundary() {
   const lm=document.getElementById('login-mode'), sm=document.getElementById('signup-mode');
   if(lm) lm.style.display='none';
   if(sm) sm.style.display='block';
-  const su=document.getElementById('signup-user');
-  if(su) su.value=expiredUser||'';
+  const su=document.getElementById('signup-user'), sg=document.getElementById('signup-group');
+  if(su) su.value=expiredUser||''; if(sg) sg.value=currentGroup||'';
   toast('Daily account expired. Recreate '+expiredUser+' for the new UTC day.','warn');
 }
 ['mousedown','keydown','touchstart','scroll'].forEach(ev=>document.addEventListener(ev,resetSessionTimer,true));
@@ -1230,8 +1351,10 @@ function selectSavedAccount() {}
    UI HELPERS
    ============================================================ */
 function copyAddr() {
-  navigator.clipboard.writeText(username+'@open.mail')
-    .then(()=>toast('Address copied: '+username+'@open.mail','success'));
+  const addr=openMailAddress(username);
+  navigator.clipboard.writeText(addr)
+    .then(()=>toast('Address copied: '+addr,'success'))
+    .catch(()=>prompt('Copy address:',addr));
 }
 function showInbox() {
   currentFolder='inbox';
@@ -1263,7 +1386,7 @@ function clearCache() {
    rolling bins plus the old literal bin for reads. Per-user mailboxes remain
    filename namespaces because Filebin bins are flat. */
 const SHARED_BIN = OPENMAIL_LOGICAL_BIN;
-function getBinId(/* user */) { return SHARED_BIN; }
+function getBinId(/* user */) { return openMailGroupLogicalBin(currentGroup); }
 function userSlug(user) {
   return String(user||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || 'user';
 }
@@ -1275,8 +1398,9 @@ function getMyPrefix() { return userPrefix(username); }
 /* ============================================================
    NETWORK LAYER -- direct fetch, no proxy, with API log
    ============================================================ */
-function getQueue() { try{return JSON.parse(localStorage.getItem('openmail_queue_'+(username||'_'))||'[]');}catch(e){return[];} }
-function setQueue(q) { localStorage.setItem('openmail_queue_'+(username||'_'),JSON.stringify(q)); }
+function queueStorageKey(){ return 'openmail_queue_'+(currentGroupId()||'nogroup')+'_'+(username||'_'); }
+function getQueue() { try{return JSON.parse(localStorage.getItem(queueStorageKey())||'[]');}catch(e){return[];} }
+function setQueue(q) { localStorage.setItem(queueStorageKey(),JSON.stringify(q)); }
 function queueItem(item) {
   const q=getQueue(); q.push({...item,ts:Date.now(),retries:0}); setQueue(q);
   updateQueueBadge(); toast('Queued -- will retry on next refresh','warn');
@@ -1652,7 +1776,7 @@ function esc(s){if(s==null)return'';return String(s).replace(/[&<>'"]/g,m=>({'&'
 function renderInbox() {
   const box=document.getElementById('inbox-content');
   if(!emails.length){
-    box.innerHTML=`<div class="empty"><h4>Inbox empty</h4><p>Your address: <strong style="color:var(--g0)">${esc(username)}@open.mail</strong><br>Share it and wait for messages.<br><br><span style="color:var(--g4);font-size:11px">Messages are E2E encrypted &middot; X25519+AES-GCM</span></p></div>`;
+    box.innerHTML=`<div class="empty"><h4>Inbox empty</h4><p>Your address: <strong style="color:var(--g0)">${esc(openMailAddress(username))}</strong><br>Share it and wait for messages.<br><br><span style="color:var(--g4);font-size:11px">Messages are E2E encrypted &middot; X25519+AES-GCM</span></p></div>`;
     return;
   }
   emails.sort((a,b)=>(b.date||0)-(a.date||0));
@@ -1755,7 +1879,7 @@ function readEmail(idx) {
   currentEmailIdx=idx; const em=emails[idx]; if(!em) return;
   document.getElementById('read-subject').textContent=em.subject||'(no subject)';
   document.getElementById('read-from').textContent=em.from||'Unknown';
-  document.getElementById('read-to').textContent=username+'@open.mail';
+  document.getElementById('read-to').textContent=openMailAddress(username);
   document.getElementById('read-date').textContent=em.date?new Date(em.date).toLocaleString():'Unknown';
   document.getElementById('read-body').innerHTML=formatBodyWithAttachments(em.body);
   document.getElementById('reader-modal').classList.add('active');
@@ -1764,7 +1888,7 @@ function readEmail(idx) {
 function readSentEmail(idx) {
   const em=sentMails[idx]; if(!em) return; currentEmailIdx='sent:'+idx;
   document.getElementById('read-subject').textContent=em.subject||'(no subject)';
-  document.getElementById('read-from').textContent=em.from||username+'@open.mail';
+  document.getElementById('read-from').textContent=em.from||openMailAddress(username);
   document.getElementById('read-to').textContent=em.to||'-';
   document.getElementById('read-date').textContent=em.date?new Date(em.date).toLocaleString():'Unknown';
   document.getElementById('read-body').innerHTML=formatBodyWithAttachments(em.body);
@@ -1917,7 +2041,7 @@ function closeCompose(){
 function replyToCurrent() {
   if(currentEmailIdx==null||typeof currentEmailIdx==='string') return;
   const em=emails[currentEmailIdx]; if(!em) return; closeModal();
-  const fromUser=(em.from||'').replace(/@.*$/,'');
+  const fromUser=em.from||'';
   openCompose(fromUser,(em.subject||'').startsWith('Re:')?em.subject:'Re: '+em.subject,'\n\n> '+(em.body||'').replace(/\n/g,'\n> '));
 }
 
@@ -2004,16 +2128,21 @@ function updateComposeCounter() {
    ============================================================ */
 async function sendEmail() {
   const rawTo=document.getElementById('compose-to').value.trim();
-  if(!rawTo) return toast('Recipient username required','error');
-  // Recipient may be "username" or "username:<pubkey>" (for users not in the registry)
+  if(!rawTo) return toast('Recipient address required','error');
+  // Accept either the canonical user@group.open.mail address or a bare username
+  // for convenience inside the currently logged-in group. A :<pubkey> suffix is
+  // still accepted for direct-key delivery.
   let toRaw=rawTo, inlinePub=null;
   const sepIdx=rawTo.indexOf(':');
   if(sepIdx>-1){ toRaw=rawTo.slice(0,sepIdx); inlinePub=rawTo.slice(sepIdx+1).trim(); }
-  const toUser=toRaw.toLowerCase().replace(/[^a-z0-9_-]/g,'');
+  const parsedTo=parseOpenMailAddress(toRaw);
+  if(!parsedTo) return toast('Use user@group.open.mail or a username','error');
+  if(parsedTo.group!==currentGroup) return toast('Recipient belongs to group "'+parsedTo.group+'". Log in to that group to send.','error');
+  const toUser=parsedTo.user;
+  const toAddr=openMailAddress(toUser,parsedTo.group);
   const subject=document.getElementById('compose-subject').value.trim();
   let body=document.getElementById('compose-body').value;
-  if(!toUser) return toast('Recipient username required','error');
-  dbg(`=== SEND to "${toUser}" ===`);
+  dbg(`=== SEND to "${toAddr}" ===`);
 
   // Resolve recipient public key. Registry is a convenience, not a requirement:
   // any user is reachable as long as we have their public key.
@@ -2028,10 +2157,10 @@ async function sendEmail() {
     if(recPubB64) dbg(`Using cached pubkey for ${toUser}`,'ok');
   }
   if(!recPubB64){
-    recPubB64=prompt('"'+toUser+'" is not in the registry.\nPaste their public key to send anyway (leave blank to cancel):');
+    recPubB64=prompt('"'+toAddr+'" is not in the group registry.\nPaste their public key to send anyway (leave blank to cancel):');
     if(recPubB64) recPubB64=recPubB64.trim();
   }
-  if(!recPubB64) return toast('No public key for "'+toUser+'" \u2014 cannot encrypt','error');
+  if(!recPubB64) return toast('No public key for "'+toAddr+'" \u2014 cannot encrypt','error');
   let recPubKey;
   try{recPubKey=await CRYPTO.importPublicRaw(b64UrlToBytes(recPubB64));}
   catch(e){return toast('Recipient public key invalid','error');}
@@ -2053,7 +2182,7 @@ async function sendEmail() {
     subjectNorm += ` [${selectedAttachments.length} attachment${selectedAttachments.length > 1 ? 's' : ''}: ${attNames}]`;
   }
   const now=Date.now();
-  const fromAddr=username+'@open.mail';
+  const fromAddr=openMailAddress(username);
   toast('Encrypting...','warn');
   let parts;
   try{parts=await encryptEmailFilenames(recPubKey,fromAddr,subjectNorm,fullBody,now);}
@@ -2068,7 +2197,7 @@ async function sendEmail() {
       try{await uploadToServer(recipientBin,rcptPrefix+parts.chunks[i],'{}');}
       catch(e){await delay(400);await uploadToServer(recipientBin,rcptPrefix+parts.chunks[i],'{}');}
     }
-    sentMails.push({from:fromAddr,to:toUser+'@open.mail',subject:subjectNorm,date:now,body:fullBody,snippet:fullBody.replace(/\s+/g,' ').slice(0,90),filename:parts.header,chunks:parts.chunks});
+    sentMails.push({from:fromAddr,to:toAddr,subject:subjectNorm,date:now,body:fullBody,snippet:fullBody.replace(/\s+/g,' ').slice(0,90),filename:parts.header,chunks:parts.chunks});
     await saveUserData();
     closeCompose();
     dbg(`Sent: ${parts.chunks.length+1} parts to ${recipientBin}`,'ok');
@@ -2147,7 +2276,7 @@ let selectedScanUser = null;
    the shared filebin registry is briefly unreachable. It is seeded
    from registry scans and from the senders of received mail.
    ------------------------------------------------------------ */
-function _contactKey(){ return 'openmail_contacts_'+(username||'_'); }
+function _contactKey(){ return 'openmail_contacts_'+(currentGroupId()||'nogroup')+'_'+(username||'_'); }
 function loadContacts(){
   try { return JSON.parse(localStorage.getItem(_contactKey())||'{}'); }
   catch(e){ return {}; }
@@ -2234,7 +2363,7 @@ async function openScanUsers() {
       ${parsed.map((u, i) => `
         <div class="scan-row" id="sr-${i}" onclick="selectScanUser(${i})" style="cursor:pointer">
           <span class="scan-idx">${i+1}</span>
-          <span class="scan-user">${esc(u.uname)}@open.mail</span>
+          <span class="scan-user">${esc(openMailAddress(u.uname))}</span>
           <span class="scan-ts">${u.ts ? new Date(u.ts).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '?'}</span>
           <span class="scan-key" title="${esc(u.pubB64)}">pub: ${esc(u.pubB64.slice(0,20))}...</span>
         </div>`).join('')}
@@ -2290,6 +2419,7 @@ function showLogin(){
   document.getElementById('login-user').value='';
   document.getElementById('login-pass').value='';
   document.getElementById('signup-user').value='';document.getElementById('signup-pass').value='';document.getElementById('signup-confirm').value='';
+  initializeGroupSelection();
   document.getElementById('login-mode').style.display='block';document.getElementById('signup-mode').style.display='none';
   renderSavedAccounts();
   setTimeout(()=>{
@@ -2299,7 +2429,7 @@ function showLogin(){
   },100);
 }
 showLogin();
-dbg(`No saved users · daily accounts · write ${openMailActiveBin()} · read ${openMailCandidateBins(true).length} bins`, 'ok');
+dbg(`No saved users · daily accounts · group ${currentGroup||'(select at login)'} · write ${openMailActiveBin(getBinId())} · read ${openMailResolveReadBins(getBinId()).length} bins`, 'ok');
 ['input','keyup','change'].forEach(ev=>{
   const b=document.getElementById('compose-body');if(b)b.addEventListener(ev,updateComposeCounter);
   const s=document.getElementById('compose-subject');if(s)s.addEventListener(ev,updateComposeCounter);
@@ -2363,25 +2493,32 @@ window.addEventListener('keydown',e=>{
   const delay = ms => new Promise(r => setTimeout(r, ms));
   function resolveWriteBin(binId){
     if(typeof root.openMailResolveWriteBin === 'function') return root.openMailResolveWriteBin(binId);
-    if(binId && binId !== 'openmail') return String(binId);
-    return bridgeRollingBin(0);
+    const s=String(binId||'');
+    if(s.startsWith('openmail-g-')) return bridgeRollingBin(0,s.slice('openmail-g-'.length));
+    if(s && s !== 'openmail') return s;
+    return bridgeRollingBin(0,'');
   }
   function bridgeFnv1a(text){
     let h=0x811c9dc5; text=String(text||'');
     for(let i=0;i<text.length;i++) h=Math.imul(h^text.charCodeAt(i),0x01000193)>>>0;
     return h.toString(36);
   }
-  function bridgeRollingBin(offset){
-    const day=Math.floor(Date.now()/86400000)+Number(offset||0), seed='openmail-fixed-rolling-2026';
-    return 'omr1-'+bridgeFnv1a(seed+':'+day)+bridgeFnv1a(day+':'+seed);
+  function bridgeRollingBin(offset,groupId){
+    const day=Math.floor(Date.now()/86400000)+Number(offset||0);
+    const gid=String(groupId||'');
+    const seed=gid?'openmail-fixed-rolling-2026:group:'+gid:'openmail-fixed-rolling-2026';
+    const tag=gid?gid.slice(0,7)+'-':'';
+    return 'omr2-'+tag+bridgeFnv1a(seed+':'+day)+bridgeFnv1a(day+':'+seed);
   }
   function resolveReadBins(binId){
     if(typeof root.openMailResolveReadBins === 'function') return root.openMailResolveReadBins(binId);
-    if(binId && binId !== 'openmail') return [String(binId)];
+    const s=String(binId||'');
+    const gid=s.startsWith('openmail-g-')?s.slice('openmail-g-'.length):'';
+    if(s && s !== 'openmail' && !gid) return [s];
     const out=[];
-    for(let i=0;i<=7;i++) out.push(bridgeRollingBin(-i));
-    out.push('openmail');
-    return out;
+    for(let i=0;i<=7;i++) out.push(bridgeRollingBin(-i,gid));
+    if(!gid) out.push('openmail');
+    return Array.from(new Set(out));
   }
 
   function log(msg, type){
@@ -3093,13 +3230,14 @@ window.addEventListener('keydown',e=>{
 <script id="openmail-acnet-crosscompat-contract">
 (function installOpenMailACNETCrossCompatContract(){
   'use strict';
-  const VERSION='OPENMAIL_ACNET_CROSSCOMPAT_2026_07_16B_PREFIXED_NAMES';
+  const VERSION='OPENMAIL_ACNET_CROSSCOMPAT_2026_09_06_GROUP_ROLLING';
   function expectedPrefix(user){ return 'u.'+String(user||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'')+'.'; }
   window.OpenMailACNETCrossCompat={
     version:VERSION,
     logicalBin:OPENMAIL_LOGICAL_BIN,
-    activeBin:openMailActiveBin,
-    readBins:function(){ return openMailResolveReadBins(OPENMAIL_LOGICAL_BIN); },
+    groupLogicalBin:function(){ return getBinId(username); },
+    activeBin:function(){ return openMailResolveWriteBin(getBinId(username)); },
+    readBins:function(){ return openMailResolveReadBins(getBinId(username)); },
     userPrefix:userPrefix,
     credentialPrefix:CRED_FN_PREFIX,
     credentialChunkBudget:CRED_FN_CHUNK_BUDGET,
@@ -3109,14 +3247,14 @@ window.addEventListener('keydown',e=>{
     listViaACNET:async function(user,scope,opts){
       opts=opts||{};
       if(typeof window.omList!=='function') throw new Error('ACNET Open.Mail list bridge is not available in this page');
-      return await window.omList(OPENMAIL_LOGICAL_BIN,userPrefix(user),{scope:scope||'mail',limit:opts.limit||24,compact:opts.compact!==false});
+      return await window.omList(getBinId(user),userPrefix(user),{scope:scope||'mail',limit:opts.limit||24,compact:opts.compact!==false});
     },
     uploadViaACNET:async function(filename,content,bin){
       if(typeof window.omUpload!=='function') throw new Error('ACNET Open.Mail upload bridge is not available in this page');
-      return await window.omUpload(filename,content==null?'{}':content,bin||OPENMAIL_LOGICAL_BIN);
+      return await window.omUpload(filename,content==null?'{}':content,bin||getBinId(username));
     },
     selfTest:function(){
-      const t=Date.UTC(2026,6,16,12,0,0),sample=openMailBinForDayOffset(0,t);
+      const t=Date.UTC(2026,6,16,12,0,0),gidA=openMailGroupId('alpha'),gidB=openMailGroupId('beta'),sample=openMailBinForDayOffset(0,t,gidA),sampleB=openMailBinForDayOffset(0,t,gidB);
       const bridgePrefix=window.OpenMailACNETBridge&&window.OpenMailACNETBridge.userPrefix?window.OpenMailACNETBridge.userPrefix('test_user'):'';
       // Prefixed-name tolerance: an ACNET-written credential set listed with its
       // full logical "u.<slug>." names must reconstruct here (mirrors ACNET).
@@ -3129,10 +3267,10 @@ window.addEventListener('keydown',e=>{
         const rec=reconstructCredentialsFromFiles(names.map(n=>({name:n})),'xc_test');
         prefixedCredOk=!!(rec&&rec.pubKeyB64==='A'.repeat(43)&&rec.username==='xc_test');
       }catch(_){}
-      return {ok:sample===openMailBinForDayOffset(0,t)&&userPrefix('test_user')===expectedPrefix('test_user')&&bridgePrefix===userPrefix('test_user')&&CRED_FN_CHUNK_BUDGET===72&&CHUNK_RAW_BUDGET===75&&prefixedCredOk,active:openMailActiveBin(),sample,lookback:openMailResolveReadBins('openmail').length,prefix:userPrefix('test_user'),bridgePrefix,prefixedCredOk,nativeACNET:this.nativeACNETAvailable()};
+      return {ok:sample===openMailBinForDayOffset(0,t,gidA)&&sample!==sampleB&&userPrefix('test_user')===expectedPrefix('test_user')&&bridgePrefix===userPrefix('test_user')&&CRED_FN_CHUNK_BUDGET===72&&CHUNK_RAW_BUDGET===75&&prefixedCredOk,active:openMailResolveWriteBin(getBinId(username)),sample,sampleB,groupSeparated:sample!==sampleB,lookback:openMailResolveReadBins(getBinId(username)).length,prefix:userPrefix('test_user'),bridgePrefix,prefixedCredOk,nativeACNET:this.nativeACNETAvailable()};
     }
   };
-  try{ dbg('ACNET cross-compat contract active · '+openMailActiveBin(),'ok'); }catch(_){}
+  try{ dbg('ACNET cross-compat contract active · group-aware rolling bins','ok'); }catch(_){}
 })();
 </script>
 
