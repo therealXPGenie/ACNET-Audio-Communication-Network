@@ -17,6 +17,7 @@ See ACKNOWLEDGEMENTS.md, NOTICE and THIRD_PARTY_LICENSES/ in the release.
 <!-- ACNET PD290 DIRTY-CHANNEL RECOVERY R1: bounded incremental VIS scanning, throttled fallback sync search, cooperative work cap, and automatic stale/false-lock recovery prevent noisy/occupied channels from freezing the SSTV decoder. -->
 <!-- ACNET TELEMETRY DUAL-PORT VALIDATION: production TTY wire/DSP preserved after regression testing; adds a deterministic A↔B production-path virtual sound-card/audio stress harness for encoder/modulator/demodulator/FEC/CRC validation. -->
 <!-- ACNET DTMF WEB R1: 12-key telephone-tone packet transport with CRC-16, streaming dual-tone detection, CHK/ACK relay browsing, and compact text-first page responses. -->
+<!-- ACNET DTMF WEB R2 UNRESTRICTED: removes the DTMF-only 1 KB/text-only browser downgrade and cache exclusion. DTMF now uses the normal compressed/renderable browser response pipeline and long-body cap, while retaining short 36B CHK payloads and DTMF-specific ACK/turnaround timing for telephone-link reliability. -->
 <!-- ACNET MANUAL TX/RX CURSORS R1: independent draggable PRE/data-tone headers for 2-FSK/4-FSK and MARK/SPACE for TTY; RX cursors feed production detectors, TX cursors feed production encoders; local persistence + per-side reset. -->
 <!-- ACNET CYRINX R70 BPSK ACK MAX RELIABILITY: R67 slow client turnaround retained. ACK copies are spaced beyond worst observed first-copy decode rejection time; relay ACK windows use ACK-R4-only decoding, full failed-frame flushing, safe soft combining, and ACK-only TX gain. -->
 <!-- ACNET CYRINX R41 NATIVE COLLECT STATE: Cyrinx now drives ACNET decoder.state LOCK/COLLECT/DECODE, RX-busy timing and ACK re-arm safety. -->
@@ -1946,7 +1947,7 @@ const ACNET_NORMAL_FETCH_CHUNK_MAX_BYTES = 175;
 // prevents old low-speed adaptive paths from expanding to 120-180B.
 const ACNET_HAM_PAYLOAD_MAX_BYTES = 100;
 const ACNET_FSK_FRAME_OVERHEAD_BYTES = 12; // MAGIC+SYNC+LEN+LENCOPY+CRC+CRCCOPY
-const ACNET_DTMF_WEB_BODY_MAX = 1024; // text-first browsing cap for telephone links
+const ACNET_DTMF_WEB_BODY_MAX = 180000; // R2 compatibility value: DTMF no longer has a special text-only browser cap
 // FIX3: Byte caps alone were not enough at 20-30 sym/s: the log showed a
 // 152B wire frame staying on-air ~29s. Keep the 165/175B hard limits, but
 // also cap each FSK burst by airtime so noise/interruptions cost one short
@@ -14700,9 +14701,9 @@ function processRelayRequest(text, crcOk) {
     return;
   }
 
-  // DTMF pages use a deliberately small text-only representation. Do not
-  // replay a larger HTML response cached while another modulation was active.
-  const _cachedResp = (CFG && CFG.mod === 'dtmf') ? null : getRelayCache(url);
+  // R2: DTMF uses the same renderable response format as the other browser transports,
+  // so cached responses are wire/application compatible and may be replayed normally.
+  const _cachedResp = getRelayCache(url);
   if (_cachedResp) {
     addMsg('sys', `♻ Relay cache hit: ${parsedUrl.hostname} · replaying ${_cachedResp.respText.length}B`);
     bStat.textContent = `♻ Replaying cached ${parsedUrl.hostname}…`;
@@ -14827,7 +14828,7 @@ function processRelayRequest(text, crcOk) {
       const body = await buildRelayBody(raw, ct, parsedUrl.hostname);
 
       const respText = buildRelayResponse(r.status, parsedUrl.hostname, body);
-      if (!(CFG && CFG.mod === 'dtmf')) putRelayCache(url, parsedUrl.hostname, r.status, respText);
+      putRelayCache(url, parsedUrl.hostname, r.status, respText);
       addMsg('sys', `✓ [RELAY-9] Built response: ${respText.length}B`);
       relayTxWarn(respText);
 
@@ -16976,7 +16977,8 @@ function _relayLegacyBodyCap() {
   return 3000;
 }
 function _relayBodyCap() {
-  if (typeof CFG !== 'undefined' && CFG && CFG.mod === 'dtmf') return ACNET_DTMF_WEB_BODY_MAX;
+  // R2: DTMF uses the same normal long-body budget as other non-HAM modulations.
+  // Its practical airtime is still controlled by short acknowledged CHK packets.
   try {
     if (typeof _acnetChunkHamModeActive === 'function' && _acnetChunkHamModeActive()) {
       return ACNET_HAM_RESPONSE_CAP_BYTES;
@@ -17568,31 +17570,10 @@ async function buildRelayBody(raw, ct, hostname) {
     // Keep json as-is
   }
 
-  // Telephone DTMF is intentionally narrow. Convert pages to readable text,
-  // retain a short list of navigable links, and cap the result so the user can
-  // actually browse instead of waiting for a multi-hour HTML transfer.
-  if (CFG && CFG.mod === 'dtmf') {
-    let text;
-    if (ct.includes('html') || isActuallyHtml) {
-      text = _ham33HtmlToText(raw, hostname);
-      // Convert the extractor's readable link list into the lightweight
-      // markdown form already handled by ACNET's safe clickable-link renderer.
-      text = text
-        .replace(/^- (.+?) - ((?:https?:\/\/|\/)\S+)$/gm, '• [$1]($2)')
-        .replace(/^- ((?:https?:\/\/|\/)\S+)$/gm, '• [$1]($1)');
-    } else if (ct.includes('json') || isActuallyJson) {
-      try { text = JSON.stringify(JSON.parse(raw), null, 2); }
-      catch(_) { text = raw; }
-      text = _ham33NormalizeText(text);
-    } else {
-      text = _ham33NormalizeText(raw);
-    }
-    text = _ham33CapUtf8(text, Math.max(128, rawBudget - 4));
-    addMsg('sys', `☎ DTMF web: text-first response ${_ham33Utf8Len(text)}B/${rawBudget-4}B`);
-    return 'TXT:' + text;
-  }
-
-  addMsg('sys', `📡 Relay: ${bpsEff}bps × ${targetSec}s ≈ ${timeBudgetBytes}B est, using cap=${rawBudget}B (chunked)`);
+  // R2: DTMF is a full browser transport. Do not force text-only conversion or
+  // truncate to 1 KB here. The normal HTML/JSON compression and rendering path
+  // below is used unchanged; 36-byte CHK/ACK packets keep the acoustic link
+  // interruption-friendly despite DTMF's low raw bitrate.
 
   let content;
   if (ct.includes('html')) {
@@ -17800,7 +17781,7 @@ function relayTxWarn(respText) {
     ? Math.round(_dtmfEstimateDurationMs(bytes) / 1000)
     : Math.round(bytes * 8 / bpsEff);
   const warn = txSecN > 120
-    ? (CFG && CFG.mod === 'dtmf' ? ` ⚠ long telephone transfer — text is capped` : ` ⚠ very long — lower symbol rate`)
+    ? (CFG && CFG.mod === 'dtmf' ? ` ⚠ long telephone transfer — full page enabled` : ` ⚠ very long — lower symbol rate`)
     : txSecN > 60 ? ` ℹ long TX` : '';
   addMsg('sys', `📡 TX response ${bytes}B ~${txSecN}s${warn}`);
   return bytes;
@@ -23352,7 +23333,7 @@ $('csMod').addEventListener('change',()=>{
     }
   }
   if (typeof mailRefreshComposeWireCounter === 'function') mailRefreshComposeWireCounter();
-  if (isDTMF) addMsg('sys', '☎ DTMF telephone mode: 12-key tones · ~25 raw bit/s · web pages are converted to compact text with links (1 KB cap)');
+  if (isDTMF) addMsg('sys', '☎ DTMF telephone mode: 12-key tones · ~25 raw bit/s · full browser responses enabled · compressed/renderable pages · reliable 36B CHK/ACK transport');
 });
 if ($('csGGwaveProto')) {
   $('csGGwaveProto').addEventListener('change', () => {
@@ -30829,7 +30810,7 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
 window.ACNET_2FSK_ADVANCED={version:'2FSK-ADV1',wireCompatible:true,tones:[1000,2000],bitOrder:'MSB-first',features:['per-tone equalizer','log-likelihood slicer','multi-window consensus','CRC-guided soft repair']};
 </script>
 <script type="application/json" id="acnet-sstv-video-ggwave-replacement">{"patch":"SSTV_VIDEO_GGWAVE_REPLACEMENT","source":"acnet_video_ggwave.html","target":"ACNET_2-4fsk_ggwave_amateur_radio(2).html","sstv_module":"ACNET v7.3-pd290-profix","mode":"PD290 VIS 94 800x616 YCbCr","scope":["SSTV CSS","SSTV panel markup","complete SSTV encoder/decoder module"],"source_sstv_sha256":"02d8cfa921636f807fecb1607adedcc90429ebeabf25dec5aeb5fdad41d23c77"}</script>
-<script type="application/json" id="acnet-dtmf-web-manifest">{"patch":"DTMF-WEB-R1","release":"ACNET V2.2","keypad":"12-key DTMF","rows_hz":[697,770,852,941],"columns_hz":[1209,1336,1477],"encoding":"octal 3-bit symbols","framing":"start/end + version + sequence + length + CRC-16/CCITT","tone_ms":70,"gap_ms":50,"raw_bps":25,"web":"existing Client/Relay browser with text-first pages and links","web_body_cap_bytes":1024,"chunk_payload_bytes":36,"pd290_analyser_teardown_guard":true}</script>
+<script type="application/json" id="acnet-dtmf-web-manifest">{"patch":"DTMF-WEB-R2-UNRESTRICTED","release":"ACNET V2.2","keypad":"12-key DTMF","rows_hz":[697,770,852,941],"columns_hz":[1209,1336,1477],"encoding":"octal 3-bit symbols","framing":"start/end + version + sequence + length + CRC-16/CCITT","tone_ms":70,"gap_ms":50,"raw_bps":25,"web":"normal Client/Relay browser pipeline with compressed/renderable HTML, JSON and text","web_body_cap_bytes":180000,"chunk_payload_bytes":36,"cache_compatible":true,"text_only_restriction":false,"pd290_analyser_teardown_guard":true}</script>
 
 <script id="acnet-openmail-frag-ack-fix59-marker">
 window.ACNET_OPENMAIL_FRAGMENT_ACK_REPAIR={version:'FIX59-STOP-AND-CONFIRM',perFragmentAck:true,compactAck:'OMFACK1',compactNak:'OMFNAK1',maxFragmentAttempts:18,finalCommitRepair:true,selfTest:function(){return {ok:!!(window.__omFragAckWaiters&&typeof processOpenMailRelayRequest==='function'),perFragmentAck:true,finalCommitRepair:true};}};
