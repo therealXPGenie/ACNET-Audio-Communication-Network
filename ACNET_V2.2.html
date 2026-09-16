@@ -30125,10 +30125,22 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
     return 'HTTP/1.1 451 Unavailable For Legal Reasons\r\nContent-Type: application/json\r\nX-ACNET-OpenMail: 1\r\n\r\n'
       + JSON.stringify({ok:false,error:'HAM Mode blocks Open.Mail/private encrypted traffic'});
   }
+  // Wrapper-chain hygiene: FIX35/FIX37/FIX39 all periodically enforce guards.
+  // Check the whole known wrapper chain, not just the top function, otherwise
+  // the guards wrap one another forever and eventually overflow the JS stack.
+  function hasWrapMarker(fn, marker){
+    const seen=[];
+    for(let depth=0; typeof fn==='function' && depth<48 && seen.indexOf(fn)<0; depth++){
+      if(fn[marker]) return true;
+      seen.push(fn);
+      fn = fn._fix39Original || fn._fix37Base || fn._fix35Base || null;
+    }
+    return false;
+  }
   function wrapGlobal(name, mode){
     try {
       const fn = window[name] || (function(){ try { return eval(name); } catch(_) { return null; } })();
-      if (typeof fn !== 'function' || fn._fix35HamBlock) return;
+      if (typeof fn !== 'function' || hasWrapMarker(fn, '_fix35HamBlock')) return;
       const wrapped = function(){
         if (hamActive()) {
           const reason = 'HAM Mode blocks Open.Mail/private encrypted traffic: ' + name;
@@ -30138,6 +30150,7 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
         return fn.apply(this, arguments);
       };
       wrapped._fix35HamBlock = true;
+      wrapped._fix35Base = fn;
       window[name] = wrapped;
       try { eval(name + ' = window[name]'); } catch(_) {}
     } catch(_) {}
@@ -30145,60 +30158,60 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
   function installWrappers(){
     try {
       const base = window.renderOpenMailApp || (function(){ try { return renderOpenMailApp; } catch(_) { return null; } })();
-      if (typeof base === 'function' && !base._fix35HamBlock) {
+      if (typeof base === 'function' && !hasWrapMarker(base, '_fix35HamBlock')) {
         const wrapped = function(route){
           if (hamActive()) return renderBlocked('Open.Mail cannot be opened while HAM Mode is active.');
           return base.apply(this, arguments);
         };
-        wrapped._fix35HamBlock = true;
+        wrapped._fix35HamBlock = true; wrapped._fix35Base = base;
         window.renderOpenMailApp = wrapped;
         try { renderOpenMailApp = wrapped; } catch(_) {}
       }
     } catch(_) {}
     try {
       const baseNav = window.navTo || (function(){ try { return navTo; } catch(_) { return null; } })();
-      if (typeof baseNav === 'function' && !baseNav._fix35HamBlock) {
+      if (typeof baseNav === 'function' && !hasWrapMarker(baseNav, '_fix35HamBlock')) {
         const wrappedNav = async function(url, push){
           if (hamActive() && looksOpenMailRoute(url)) return renderBlocked('Open.Mail navigation is blocked while HAM Mode is active.');
           return await baseNav.apply(this, arguments);
         };
-        wrappedNav._fix35HamBlock = true;
+        wrappedNav._fix35HamBlock = true; wrappedNav._fix35Base = baseNav;
         window.navTo = wrappedNav;
         try { navTo = wrappedNav; } catch(_) {}
       }
     } catch(_) {}
     try {
       const baseFetch = window.fetchPage || (function(){ try { return fetchPage; } catch(_) { return null; } })();
-      if (typeof baseFetch === 'function' && !baseFetch._fix35HamBlock) {
+      if (typeof baseFetch === 'function' && !hasWrapMarker(baseFetch, '_fix35HamBlock')) {
         const wrappedFetch = async function(url){
           if (hamActive() && looksOpenMailRoute(url)) return renderBlocked('Open.Mail fetch is blocked while HAM Mode is active.');
           return await baseFetch.apply(this, arguments);
         };
-        wrappedFetch._fix35HamBlock = true;
+        wrappedFetch._fix35HamBlock = true; wrappedFetch._fix35Base = baseFetch;
         window.fetchPage = wrappedFetch;
         try { fetchPage = wrappedFetch; } catch(_) {}
       }
     } catch(_) {}
     try {
       const baseTx = window.transmit || (function(){ try { return transmit; } catch(_) { return null; } })();
-      if (typeof baseTx === 'function' && !baseTx._fix35HamBlock) {
+      if (typeof baseTx === 'function' && !hasWrapMarker(baseTx, '_fix35HamBlock')) {
         const wrappedTx = async function(text){
           if (hamActive() && OPENMAIL_RE.test(String(text||''))) return blockError('HAM Mode blocks Open.Mail OMRPC/private traffic before TX.');
           return await baseTx.apply(this, arguments);
         };
-        wrappedTx._fix35HamBlock = true;
+        wrappedTx._fix35HamBlock = true; wrappedTx._fix35Base = baseTx;
         window.transmit = wrappedTx;
         try { transmit = wrappedTx; } catch(_) {}
       }
     } catch(_) {}
     try {
       const baseNow = window._transmitNow || (function(){ try { return _transmitNow; } catch(_) { return null; } })();
-      if (typeof baseNow === 'function' && !baseNow._fix35HamBlock) {
+      if (typeof baseNow === 'function' && !hasWrapMarker(baseNow, '_fix35HamBlock')) {
         const wrappedNow = async function(text){
           if (hamActive() && OPENMAIL_RE.test(String(text||''))) return blockError('HAM Mode blocks Open.Mail OMRPC/private traffic before TX.');
           return await baseNow.apply(this, arguments);
         };
-        wrappedNow._fix35HamBlock = true;
+        wrappedNow._fix35HamBlock = true; wrappedNow._fix35Base = baseNow;
         window._transmitNow = wrappedNow;
         try { _transmitNow = wrappedNow; } catch(_) {}
       }
@@ -30211,13 +30224,13 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
     ].forEach(function(n){ wrapGlobal(n, /RelayRouteRequest|processOpenMailRelayRequest/.test(n) ? 'http' : 'promise'); });
     try {
       const baseRelayReq = window.processRelayRequest || (function(){ try { return processRelayRequest; } catch(_) { return null; } })();
-      if (typeof baseRelayReq === 'function' && !baseRelayReq._fix35HamBlock) {
+      if (typeof baseRelayReq === 'function' && !hasWrapMarker(baseRelayReq, '_fix35HamBlock')) {
         const wrappedRelayReq = async function(req, url){
           const s = String(req||'') + ' ' + String(url||'');
           if (hamActive() && OPENMAIL_RE.test(s)) { log('⚖ HAM Mode blocked Open.Mail request at relay router'); return makeHttp451(); }
           return await baseRelayReq.apply(this, arguments);
         };
-        wrappedRelayReq._fix35HamBlock = true;
+        wrappedRelayReq._fix35HamBlock = true; wrappedRelayReq._fix35Base = baseRelayReq;
         window.processRelayRequest = wrappedRelayReq;
         try { processRelayRequest = wrappedRelayReq; } catch(_) {}
       }
@@ -30338,11 +30351,20 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
   function block(reason){ renderBlocked(reason); const e = new Error(reason || 'HAM Mode blocks Open.Mail in client mode'); e.hamBlocked = true; throw e; }
   function blockPromise(reason){ renderBlocked(reason); return Promise.reject(new Error(reason || 'HAM Mode blocks Open.Mail in client mode')); }
   function canBlock(){ return hamActive(); }
+  function hasWrapMarker(fn, marker){
+    const seen=[];
+    for(let depth=0; typeof fn==='function' && depth<48 && seen.indexOf(fn)<0; depth++){
+      if(fn[marker]) return true;
+      seen.push(fn);
+      fn = fn._fix39Original || fn._fix37Base || fn._fix35Base || null;
+    }
+    return false;
+  }
   function wrap(name, opts){
     opts = opts || {};
     try {
       const base = window[name] || (function(){ try { return eval(name); } catch(_) { return null; } })();
-      if (typeof base !== 'function' || base._fix37HamClientBlock) return;
+      if (typeof base !== 'function' || hasWrapMarker(base, '_fix37HamClientBlock')) return;
       const wrapped = function(){
         if (canBlock()) {
           if (opts.onlyOpenMailArg) {
@@ -30379,20 +30401,20 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
     ['transmit','_transmitNow','transmitChunked','transmitChunkedGgwave'].forEach(n => wrap(n, {onlyOpenMailArg:true, reason:'HAM Mode blocked Open.Mail OMRPC/acnet://openmail before audio transmit.', syncThrow:false}));
     try {
       const baseRender = window.renderOpenMailApp || (function(){ try { return renderOpenMailApp; } catch(_) { return null; } })();
-      if (typeof baseRender === 'function' && !baseRender._fix37HamClientBlock) {
+      if (typeof baseRender === 'function' && !hasWrapMarker(baseRender, '_fix37HamClientBlock')) {
         const r = function(route){ if (canBlock()) return renderBlocked('Open.Mail UI is blocked while HAM Mode is active.'); return baseRender.apply(this, arguments); };
-        r._fix37HamClientBlock = true; window.renderOpenMailApp = r; try { renderOpenMailApp = r; } catch(_) {}
+        r._fix37HamClientBlock = true; r._fix37Base = baseRender; window.renderOpenMailApp = r; try { renderOpenMailApp = r; } catch(_) {}
       }
     } catch(_) {}
     try {
       const baseProcess = window.processRelayRequest || (function(){ try { return processRelayRequest; } catch(_) { return null; } })();
-      if (typeof baseProcess === 'function' && !baseProcess._fix37HamClientBlock) {
+      if (typeof baseProcess === 'function' && !hasWrapMarker(baseProcess, '_fix37HamClientBlock')) {
         const pr = async function(req, url){
           const hay = String(req || '') + ' ' + String(url || '');
           if (canBlock() && looksOpenMail(hay)) { log('⚖ HAM Mode blocked Open.Mail at relay router'); return make451(); }
           return await baseProcess.apply(this, arguments);
         };
-        pr._fix37HamClientBlock = true; window.processRelayRequest = pr; try { processRelayRequest = pr; } catch(_) {}
+        pr._fix37HamClientBlock = true; pr._fix37Base = baseProcess; window.processRelayRequest = pr; try { processRelayRequest = pr; } catch(_) {}
       }
     } catch(_) {}
   }
@@ -30464,6 +30486,15 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
   }
   function log(m){ try { addMsg('sys', m); } catch(_) { try { console.log('[ACNET FIX39]', m); } catch(__){} } }
   function setStatus(m){ try { if (window.bStat) window.bStat.textContent = m; } catch(_) {} }
+  function hasWrapMarker(fn, marker){
+    var seen=[];
+    for(var depth=0; typeof fn==='function' && depth<48 && seen.indexOf(fn)<0; depth++){
+      if(fn[marker]) return true;
+      seen.push(fn);
+      fn = fn._fix39Original || fn._fix37Base || fn._fix35Base || null;
+    }
+    return false;
+  }
   function renderBlocked(reason){
     reason = reason || 'ShowFile is blocked while HAM Mode is active.';
     try { if (typeof window.showRendered === 'function') window.showRendered(); } catch(_) {}
@@ -30503,7 +30534,7 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
 
   function installNavGuard(){
     var oldNav = window.navTo;
-    if (typeof oldNav === 'function' && !oldNav._fix39ShowFileGuard) {
+    if (typeof oldNav === 'function' && !hasWrapMarker(oldNav, '_fix39ShowFileGuard')) {
       var guarded = function(url, push){
         if (hamActive() && isShowFileText(url)) {
           block('acnet://showfile and file upload/preview are disabled while HAM Mode is active.');
@@ -30518,7 +30549,7 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
   }
   function installTxGuard(){
     var oldTx = window.transmit;
-    if (typeof oldTx === 'function' && !oldTx._fix39ShowFileGuard) {
+    if (typeof oldTx === 'function' && !hasWrapMarker(oldTx, '_fix39ShowFileGuard')) {
       var guarded = function(text, addToChat){
         if (hamActive() && isShowFileText(text)) {
           block('Client mode may not request ShowFile over audio while HAM Mode is active.');
@@ -30533,7 +30564,7 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
   }
   function installRelayGuard(){
     var oldRelay = window.processRelayRequest;
-    if (typeof oldRelay === 'function' && !oldRelay._fix39ShowFileGuard) {
+    if (typeof oldRelay === 'function' && !hasWrapMarker(oldRelay, '_fix39ShowFileGuard')) {
       var guarded = function(text, crcOk){
         if (hamActive() && isShowFileText(text)) {
           log('⚖ Relay refused ShowFile request in HAM Mode');
@@ -30554,7 +30585,7 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
   }
   function installUploadGuard(){
     var oldUpload = window._showfileHandleUploadFiles;
-    if (typeof oldUpload === 'function' && !oldUpload._fix39ShowFileGuard) {
+    if (typeof oldUpload === 'function' && !hasWrapMarker(oldUpload, '_fix39ShowFileGuard')) {
       var guarded = function(files){
         if (hamActive()) {
           block('ShowFile upload is disabled while HAM Mode is active.');
@@ -30616,6 +30647,7 @@ window.ACNET_FIX4_LOGIN_INBOX = { version: 'fix4-login-inbox', built: '2026-07-0
 })();
 </script>
 
+<script>window.ACNET_GGWAVE_OPENMAIL_STACK_FIX={version:'20260916-wrapper-chain-hygiene-r1',description:'Stops FIX35/FIX37/FIX39 periodic guard re-wrapping so Open.Mail GGwave transmit cannot accumulate an unbounded call chain.'};</script>
 <script>window.ACNET_FIX41_HAM_PAYLOAD_MAX={version:'fix41-ham-payload-max',hamPayloadMaxBytes:100,normalFetchBytes:168};</script>
 
 <script id="acnet-openmail-fix46-diagnostics">
