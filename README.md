@@ -5,7 +5,7 @@ Turn your sound card into a network adapter. An acoustic internet built for off-
 Acnet is an in-browser system that uses telemetry signals (4-FSK/2-FSK, ggwave, high-speed video (SSTV) and high resolution (picture) (PD290)) over an audio channel allowing you to surf the internet. The first of its kind—an inexpensive and simplified HTTPS-over-sound solution. Envisioned to be complimentary and off-grid, it works like a tactical communication network. Plug and play analog packet radio. Just open ACNET.html with any device that supports Edge Browser. Tested on windows 10 and windows 11(64-bit). (Tested on a Xbox one S and it is working).
 Designed to work with terrible equipment and high end equipment with a reasonable achievable max speed of 1.45kbps+ with cyrinx.
 You have a friend somewhere that you can phone and he really needs internet? You have a loved one and you want to see each other? Now it's possible!
-Acnet is the equivalent of free mobile internet.
+Acnet is the equivalent of free mobile internet and beats Lora and long range WiFi in term of range.
 
 How to use:.
 1. Open ACNET_V2.2.html with Microsoft Edge browser.
