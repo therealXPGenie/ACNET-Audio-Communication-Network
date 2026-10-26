@@ -9,7 +9,7 @@ You have a friend somewhere that you can phone and he really needs internet? You
 Acnet is the equivalent of free mobile internet and beats Lora and long range WiFi in term of range (space probe tech).
 
 How to use:.
-1. Open ACNET_V2.2.html with Microsoft Edge browser.
+1. Open ACNET_V2.3.html with Microsoft Edge browser.
 2. Choose relay/client and choose the right modulation. (turn off wifi/cellular/bluetooth internet connectivity if you are a client)
 3. Accept microphone permission.
 4. Open Acnet on another machine and repeat from step 1.
