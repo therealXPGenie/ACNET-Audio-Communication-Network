@@ -34,7 +34,7 @@ jobs:
       - name: Prepare ACNET site
         run: |
           mkdir -p _site
-          cp ACNET_V2.2.html _site/index.html
+          cp ACNET_V2.3.html _site/index.html
 
       - name: Upload ACNET
         uses: actions/upload-pages-artifact@v3
