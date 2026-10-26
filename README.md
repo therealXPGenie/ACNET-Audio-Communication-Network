@@ -1,5 +1,5 @@
 # ACNET
-Stands for: Audio Communication Network
+Audio Communication Network
 
 Turns your sound card into a network adapter. An acoustic internet built for off-grid telecommunication. One of the first, easy to use, internet of sounds tool. Runs from one .html file.
 
